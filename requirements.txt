@@ -6,6 +6,7 @@ ipywidgets
 jupyterlab
 liger-kernel==0.8.0
 nvidia-nccl-cu13==2.30.7 # really imperative for correct topology detection on our cluster/fabric
+openai==2.47.0
 pillow==12.3.0
 sentencepiece==0.2.2
 transformers>=5.5.0
