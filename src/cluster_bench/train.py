@@ -74,9 +74,14 @@ def run(spec: config.RunSpec) -> dict[str, Any]:
     # truncated inputs") -- which is exactly what the synthetic set is, so
     # max_length has nothing left to enforce. tokens/GPU/step is unchanged.
     max_length = spec.seq_len
+    # The synthetic set ships its own labels, already masked to the same 25/75
+    # prompt/completion split, so completion_only_loss has nothing left to do
+    # -- and no completion_mask to do it with.
+    completion_only_loss = spec.completion_only_loss
     if is_synthetic:
         dataset_kwargs = {"skip_prepare_dataset": True}
         max_length = None
+        completion_only_loss = False
 
     total_steps = spec.warmup_steps + spec.measure_steps
 
@@ -101,7 +106,7 @@ def run(spec: config.RunSpec) -> dict[str, Any]:
         use_liger_kernel=spec.liger,
         gradient_checkpointing=spec.gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        completion_only_loss=spec.completion_only_loss,
+        completion_only_loss=completion_only_loss,
         average_tokens_across_devices=spec.average_tokens_across_devices,
         dataset_kwargs=dataset_kwargs,
         dataloader_num_workers=spec.dataloader_num_workers,

@@ -25,16 +25,22 @@ def _synthetic(spec: RunSpec, vocab_size: int, n_samples: int) -> Dataset:
     lo = min(1000, max(1, vocab_size // 100))
     ids = rng.integers(lo, vocab_size, size=(n_samples, spec.seq_len), dtype=np.int64)
 
-    # A fixed 25% prompt / 75% completion split so completion_only_loss has
-    # the same amount of work to do in every cell.
+    # A fixed 25% prompt / 75% completion split so the number of loss-carrying
+    # tokens is the same in every cell.
+    #
+    # Labels are pre-built rather than left to `completion_mask`: on the
+    # skip_prepare_dataset path trl 1.8 never runs the step that turns a mask
+    # into labels, and rejects the dataset instead of silently training on the
+    # prompt. Masking here is the same arithmetic trl would have done
+    # (-100 wherever the mask is 0) and keeps the split intact.
     prompt_len = spec.seq_len // 4
-    mask = np.zeros(spec.seq_len, dtype=np.int64)
-    mask[prompt_len:] = 1
+    labels = ids.copy()
+    labels[:, :prompt_len] = -100
 
     return Dataset.from_dict(
         {
             "input_ids": [row.tolist() for row in ids],
-            "completion_mask": [mask.tolist()] * n_samples,
+            "labels": [row.tolist() for row in labels],
         }
     )
 
