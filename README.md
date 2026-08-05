@@ -92,6 +92,14 @@ param-gather scope: flat (global) → hpz4 (node-local) → hpz2 (pair-local).
 four GPUs' worth of compute, and a direct answer to the PCIe-vs-network
 question. Only possible with a model this small.
 
+Placements in `placement.py` are written in **node0's device order**. Peer
+nodes enumerate their GPUs in the opposite order, so `Placement.devices_for()`
+reverses the list for every `machine_rank > 0` before it becomes
+`CUDA_VISIBLE_DEVICES`. Same physical GPUs either way — what the reversal fixes
+is which local rank lands on which rail-aligned NIC. Without it, cross-node
+collectives ride mismatched rails and the run still completes, just slower, so
+2B would be measuring the launch bug rather than the interconnect tier.
+
 **2C** finds where comm stops mattering. This is the most durable output of the
 study — a portable cluster characteristic that transfers to models nobody has
 benchmarked yet.

@@ -10,6 +10,10 @@ choosing which devices on which hosts take part:
 
 `pair-per-node` vs `one-node` is the sharp comparison the whole study turns on:
 same 4 GPUs' worth of compute, one of them using zero PCIe.
+
+Device ids below are written in *node0's* order. Peer nodes enumerate their
+GPUs in the opposite order, so `devices_for()` reverses the list on every
+machine_rank > 0 -- see that method for why it matters.
 """
 
 from __future__ import annotations
@@ -22,11 +26,16 @@ from .strategies import Strategy
 # ever cabled differently -- nothing else hardcodes the pairing.
 PAIRS: tuple[tuple[int, ...], ...] = ((0, 1), (2, 3))
 
+# Membership form of PAIRS. A pair is a pair whichever way round it is listed,
+# and peer nodes list theirs reversed.
+_PAIR_SETS = frozenset(frozenset(p) for p in PAIRS)
+
 
 @dataclass(frozen=True)
 class Placement:
     name: str
-    # devices[i] = CUDA_VISIBLE_DEVICES for machine_rank i. Length = num_machines.
+    # devices[i] = the GPUs machine_rank i contributes, in *node0's* device
+    # order. Length = num_machines. Peer ranks reverse it -- use devices_for().
     devices: tuple[tuple[int, ...], ...]
     links: str
 
@@ -48,8 +57,22 @@ class Placement:
     def world_size(self) -> int:
         return sum(len(d) for d in self.devices)
 
+    def devices_for(self, machine_rank: int) -> tuple[int, ...]:
+        """The GPUs machine_rank uses, in the order that node must launch them.
+
+        Peer nodes enumerate their GPUs in the reverse of node0's order, so the
+        list is reversed for every machine_rank > 0. This selects the same
+        physical GPUs either way -- what it fixes is *which local rank lands on
+        which rail-aligned NIC*. Get it wrong and every cross-node collective
+        rides a mismatched rail, which costs bandwidth silently: the run still
+        completes, just slower, and the placement study is measuring the
+        miscabling instead of the interconnect tier it claims to.
+        """
+        devs = self.devices[machine_rank]
+        return devs if machine_rank == 0 else tuple(reversed(devs))
+
     def cuda_visible_devices(self, machine_rank: int) -> str:
-        return ",".join(str(d) for d in self.devices[machine_rank])
+        return ",".join(str(d) for d in self.devices_for(machine_rank))
 
 
 PLACEMENTS: dict[str, Placement] = {
@@ -110,14 +133,18 @@ def validate(strategy: Strategy, placement: Placement) -> list[str]:
             f"hpz=4 is only node-local when procs_per_machine == 4; placement "
             f"{placement.name} has {placement.procs_per_machine}"
         )
-    # hpZ=2 is "pair-local" only if consecutive rank pairs are NVLinked.
+    # hpZ=2 is "pair-local" only if consecutive rank pairs are NVLinked. Check
+    # the launch order each node actually gets, not node0's spelling of it --
+    # the peer's reversal can move where the chunk boundaries fall.
     if strategy.hpz == 2:
-        for rank_devs in placement.devices:
+        for rank in range(placement.num_machines):
+            rank_devs = placement.devices_for(rank)
             for lo in range(0, len(rank_devs), 2):
                 chunk = tuple(rank_devs[lo : lo + 2])
-                if len(chunk) == 2 and chunk not in PAIRS:
+                if len(chunk) == 2 and frozenset(chunk) not in _PAIR_SETS:
                     reasons.append(
                         f"hpz=2 assumes adjacent ranks are NVLinked, but "
-                        f"placement {placement.name} puts devices {chunk} together"
+                        f"placement {placement.name} puts devices {chunk} "
+                        f"together on machine_rank {rank}"
                     )
     return reasons

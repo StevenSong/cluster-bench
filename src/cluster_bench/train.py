@@ -145,7 +145,10 @@ def run(spec: config.RunSpec) -> dict[str, Any]:
             "links": place.links,
             "world_size": place.world_size,
             "num_machines": place.num_machines,
-            "devices": [list(d) for d in place.devices],
+            # As launched, per machine_rank -- peers run node0's list reversed.
+            "devices": [
+                list(place.devices_for(r)) for r in range(place.num_machines)
+            ],
         },
         "spec": spec.to_dict(),
         "model": model_info,
