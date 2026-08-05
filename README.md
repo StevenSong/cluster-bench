@@ -25,6 +25,7 @@ conda env create -f env.yaml && conda activate cluster-bench
 
 ```bash
 pip install -r requirements-flash.txt --no-build-isolation
+pip install nvidia-nccl-cu13==2.30.7
 ```
 
 flash-attn is a second command because it imports torch at build time and so
