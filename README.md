@@ -35,6 +35,16 @@ python -m cluster_bench.sweep configs/matrix/2a_sharding.yaml --hosts localhost 
 python -m cluster_bench.report --runs-dir results/runs
 ```
 
+The env must exist on **every** node. `sweep.py` activates it explicitly on
+each rank, defaulting to whichever env the driver itself is running in — peer
+ranks are launched with `ssh … bash -lc`, and `conda init` puts its shell hook
+in `~/.bashrc`, which returns early for non-interactive shells, so a peer would
+otherwise get system Python and rank 0 would sit in the rendezvous until it
+timed out. Override with `--conda-env` / `--conda-base` if the peers' install
+lives elsewhere, or `--no-conda` if their shell rc already handles it. A
+one-ssh-per-peer preflight runs before the first cell and fails loudly rather
+than at the NCCL timeout; skip it with `--no-preflight`.
+
 The narrow start — DDP ceiling plus the three hpZ variants, about 20 minutes:
 
 ```bash

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -87,6 +88,43 @@ def expand(matrix: dict[str, Any], base: config.RunSpec) -> tuple[list[Cell], li
 
 
 # ---------------------------------------------------------------------------
+# Environment activation
+#
+# machine_rank 0 runs under the shell the driver was started from, so it
+# inherits an already-activated conda env for free. A peer rank does not: ssh
+# runs `bash -lc`, and `conda init` installs its shell hook into ~/.bashrc,
+# which returns early for non-interactive shells. `conda` is then undefined on
+# the peer, `accelerate` resolves to system Python or not at all, and rank 0
+# sits in the rendezvous until it times out. So the activation is made explicit
+# and emitted into every launch command -- peers *and* rank 0, so both ranks
+# provably run the same interpreter.
+# ---------------------------------------------------------------------------
+def _detect_conda() -> tuple[str | None, str | None]:
+    """(base, env) of the conda env the driver itself is running in."""
+    env = os.environ.get("CONDA_DEFAULT_ENV") or os.environ.get("CONDA_PREFIX")
+
+    base = os.environ.get("CONDA_EXE")
+    base = str(Path(base).parent.parent) if base else None
+    if not base:
+        # No CONDA_EXE (a bare `source activate`): CONDA_PREFIX_1 is the stack's
+        # root, and in the base env itself CONDA_PREFIX already is the root.
+        base = os.environ.get("CONDA_PREFIX_1") or (
+            os.environ.get("CONDA_PREFIX") if env == "base" else None
+        )
+    return base, env
+
+
+def _activate_cmd(base: str, env: str) -> str:
+    """Shell snippet that activates `env`, hook first.
+
+    Sourcing conda.sh directly is what makes this work in a non-interactive
+    shell; `conda activate` accepts either a name or a full prefix path.
+    """
+    hook = Path(base) / "etc" / "profile.d" / "conda.sh"
+    return f". {shlex.quote(str(hook))} && conda activate {shlex.quote(env)}"
+
+
+# ---------------------------------------------------------------------------
 # Launching
 # ---------------------------------------------------------------------------
 def _write_cell_configs(cell: Cell, gen_dir: Path) -> tuple[Path, Path]:
@@ -154,6 +192,7 @@ def _launch_cmd(
     repo_dir: Path,
     env_file: Path,
     nccl_debug: str,
+    activate: str | None = None,
 ) -> str:
     devices = cell.place.cuda_visible_devices(machine_rank)
     flags = _train_flags(cell.spec) + ["--machine-rank", str(machine_rank)]
@@ -168,8 +207,10 @@ def _launch_cmd(
         "cluster_bench.train",
         *flags,
     ]
+    parts = [] if activate is None else [activate]
     return " && ".join(
         [
+            *parts,
             f"cd {shlex.quote(str(repo_dir))}",
             f". {shlex.quote(str(env_file))}",
             # env.sh may be left at NCCL_DEBUG=INFO after topology work; timing
@@ -199,12 +240,47 @@ def _push_configs(host: str, gen_dir: Path, remote_dir: Path) -> None:
     )
 
 
+def preflight(host: str, args: argparse.Namespace) -> None:
+    """Check a peer can reach the repo and the env before any cell starts.
+
+    One ssh per peer, once per sweep. Without it, a peer whose env didn't
+    activate shows up as rank 0 hanging in the rendezvous for the full NCCL
+    timeout, once per cell, with the real error buried in a rank log.
+    """
+    parts = ([args.activate] if args.activate else []) + [
+        f"cd {shlex.quote(str(args.remote_dir))}",
+        "python -c 'import accelerate, cluster_bench'",
+        "command -v accelerate",
+    ]
+    p = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", host, f"bash -lc {shlex.quote(' && '.join(parts))}"],
+        capture_output=True,
+        text=True,
+    )
+    if p.returncode != 0:
+        raise SystemExit(
+            f"preflight failed on {host} (exit {p.returncode}):\n"
+            f"{(p.stderr or p.stdout).strip()}\n"
+            f"The peer runs `bash -lc`, which does not pick up conda's shell "
+            f"hook from ~/.bashrc. Check --conda-base/--conda-env and that "
+            f"{args.remote_dir} is a checkout with the env installed."
+        )
+    where = (p.stdout.strip().splitlines() or ["ok"])[-1]
+    print(f"  preflight {host}: {where}")
+
+
 def run_cell(cell: Cell, args: argparse.Namespace) -> dict[str, Any]:
     accel_path, gen_dir = _write_cell_configs(cell, Path(args.generated_dir))
     started = time.time()
 
     local_cmd = _launch_cmd(
-        cell, accel_path, 0, Path(args.repo_dir), Path(args.env_file), args.nccl_debug
+        cell,
+        accel_path,
+        0,
+        Path(args.repo_dir),
+        Path(args.env_file),
+        args.nccl_debug,
+        args.activate,
     )
     peer_cmds = {
         rank: _launch_cmd(
@@ -214,6 +290,7 @@ def run_cell(cell: Cell, args: argparse.Namespace) -> dict[str, Any]:
             Path(args.remote_dir),
             Path(args.env_file),
             args.nccl_debug,
+            args.activate,
         )
         for rank in range(1, cell.place.num_machines)
     }
@@ -224,7 +301,7 @@ def run_cell(cell: Cell, args: argparse.Namespace) -> dict[str, Any]:
         print(f"  local (machine_rank 0):\n     {local_cmd}")
         return {"run_id": cell.run_id, "status": "dry-run"}
 
-    peers: list[subprocess.Popen] = []
+    peers: list[tuple[int, subprocess.Popen]] = []
     logs: list[Any] = []
     for rank, cmd in peer_cmds.items():
         host = args.hosts[rank]
@@ -233,28 +310,44 @@ def run_cell(cell: Cell, args: argparse.Namespace) -> dict[str, Any]:
         log = (gen_dir / f"rank{rank}.log").open("w")
         logs.append(log)
         peers.append(
-            subprocess.Popen(
-                ["ssh", "-o", "BatchMode=yes", host, f"bash -lc {shlex.quote(cmd)}"],
-                stdout=log,
-                stderr=subprocess.STDOUT,
+            (
+                rank,
+                subprocess.Popen(
+                    ["ssh", "-o", "BatchMode=yes", host, f"bash -lc {shlex.quote(cmd)}"],
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                ),
             )
         )
 
     print("  -> local (machine_rank 0)")
     rc = subprocess.run(["bash", "-lc", local_cmd]).returncode
 
-    for p in peers:
+    # A peer that dies at startup (missing env, missing config) doesn't fail
+    # rank 0 -- rank 0 blocks in the rendezvous until it times out, which reads
+    # like a hang rather than an error. Record the peer's exit code so the
+    # sweep log says which rank actually broke.
+    peer_rcs: dict[str, int] = {}
+    for rank, p in peers:
         try:
             p.wait(timeout=args.peer_timeout)
         except subprocess.TimeoutExpired:
             p.kill()
+            p.wait()
+        peer_rcs[str(rank)] = p.returncode
     for f in logs:
         f.close()
 
+    for rank, prc in peer_rcs.items():
+        if prc != 0:
+            print(f"  peer rank {rank} exited {prc}; see {gen_dir}/rank{rank}.log")
+
+    ok = rc == 0 and all(prc == 0 for prc in peer_rcs.values())
     return {
         "run_id": cell.run_id,
-        "status": "ok" if rc == 0 else "failed",
+        "status": "ok" if ok else "failed",
         "returncode": rc,
+        "peer_returncodes": peer_rcs,
         "elapsed_s": time.time() - started,
     }
 
@@ -290,6 +383,18 @@ def main() -> None:
     ap.add_argument("--generated-dir", default="results/generated")
     ap.add_argument("--nccl-debug", default="WARN")
     ap.add_argument("--peer-timeout", type=float, default=300.0)
+    default_base, default_env = _detect_conda()
+    ap.add_argument("--conda-env", default=default_env,
+                    help="conda env name or prefix to activate on every rank "
+                         f"(default: the driver's own, {default_env!r})")
+    ap.add_argument("--conda-base", default=default_base,
+                    help="conda install root, holding etc/profile.d/conda.sh "
+                         f"(default: {default_base!r})")
+    ap.add_argument("--no-conda", dest="use_conda", action="store_false",
+                    help="don't activate anything; the shell rc on every node "
+                         "is expected to put the right python on PATH")
+    ap.add_argument("--no-preflight", dest="preflight", action="store_false",
+                    help="skip the per-peer import check before the first cell")
     ap.add_argument("--only", nargs="*", default=None,
                     help="run only these strategies/placements (exact names), "
                          "or cells whose run_id contains the given text")
@@ -301,6 +406,18 @@ def main() -> None:
     config.add_arguments(ap)
     args = ap.parse_args()
     args.remote_dir = args.remote_dir or args.repo_dir
+
+    args.activate = None
+    if args.use_conda:
+        if not (args.conda_base and args.conda_env):
+            raise SystemExit(
+                "could not detect the conda env to activate on the peer nodes "
+                f"(base={args.conda_base!r}, env={args.conda_env!r}). Run the "
+                "sweep from inside `conda activate cluster-bench`, pass "
+                "--conda-base/--conda-env, or pass --no-conda if the peers' "
+                "shell rc already puts the right python on PATH."
+            )
+        args.activate = _activate_cmd(args.conda_base, args.conda_env)
 
     base = config.from_args(args)
     matrix = yaml.safe_load(Path(args.matrix).read_text())
@@ -323,6 +440,10 @@ def main() -> None:
         print(f"  cell  {c.run_id}  [{c.place.links}]")
     if args.list:
         return
+
+    if args.preflight and not args.dry_run:
+        for host in args.hosts[1:needed]:
+            preflight(host, args)
 
     results = []
     for i, cell in enumerate(cells, 1):
