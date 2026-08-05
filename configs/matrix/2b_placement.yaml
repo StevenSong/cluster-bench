@@ -1,0 +1,30 @@
+# Matrix 2B -- placement study. Run the top 3 configs from 2A.
+#
+# The sharp comparison is `one-node` vs `pair-per-node`: the same 4 GPUs'
+# worth of compute, one using NVLink+PCIe and the other NVLink+RoCE with zero
+# PCIe. That is the direct answer to whether the cross-pair PCIe hop is worse
+# than the network. It is only possible with a model small enough to run on 4.
+#
+# Cells whose (strategy, placement) pair is not measurable -- hpz=4 on a 2-GPU
+# placement, say -- are skipped automatically rather than silently degraded.
+#
+# Budget: up to 18 cells, ~1.5 hr. Edit `strategies` after reading 2A.
+
+defaults:
+  seq_len: 4096
+  micro_batch: 2
+  warmup_steps: 20
+  measure_steps: 80
+
+strategies:
+  - ddp
+  - zero3
+  - zero3-hpz2
+
+placements:
+  - within-pair           # 2 GPU, NVLink only
+  - across-pairs          # 2 GPU, PCIe only
+  - across-nodes          # 2 GPU, RoCE only
+  - one-node              # 4 GPU, NVLink + PCIe
+  - pair-per-node         # 4 GPU, NVLink + RoCE, zero PCIe
+  - full                  # 8 GPU, everything

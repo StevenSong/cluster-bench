@@ -1,0 +1,32 @@
+# Correctness gate -- run this before trusting any timing number.
+#
+# Every sharding config must reproduce the same loss curve at a fixed seed on
+# a real dataset. This is what catches packing-mask and loss-normalization
+# bugs, which otherwise present as a config that is impressively fast and
+# quietly wrong.
+#
+# Uses the real dataset (not synthetic) because a packing-mask bug is
+# invisible on pre-tokenized fixed-length samples -- there is nothing to pack.
+#
+#   python -m cluster_bench.sweep configs/matrix/gate_correctness.yaml
+#   python -m cluster_bench.report --reference ddp__full__t8192__s4096__gate
+
+defaults:
+  dataset: /opt/gpudata/medical-o1-reasoning-SFT
+  dataset_config: en
+  seq_len: 4096
+  micro_batch: 2
+  packing: true
+  packing_strategy: bfd
+  completion_only_loss: true
+  warmup_steps: 0          # the loss curve starts at step 0
+  measure_steps: 60
+  tag: gate
+
+placements: [full]
+
+strategies:
+  - ddp
+  - zero3
+  - zero3-hpz4
+  - zero3-hpz2

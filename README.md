@@ -1,10 +1,194 @@
-# Gemma4-Medical-SFT
-a small demo to fine-tune gemma-4-31B for the medical domain
+# cluster-bench
+
+Acceptance and interconnect benchmarking for new cluster nodes.
+
+The cluster is 2 nodes × 4 H200 (141 GB). GPUs are in **NVLinked pairs**, 2×2
+per node, with no NVSwitch — so the NVLink domain is 2 GPUs wide. Each pair has
+its own rail-aligned NIC over RoCEv2. That gives three interconnect tiers:
+
+```
+NVLink (in-pair)  >>  PCIe (cross-pair, same node)  ≈  RoCE (cross-node)
+```
+
+The open question driving everything: **is the cross-pair PCIe hop worse than
+the network?** If it is, the right sharding strategy is not the obvious one.
+
+Tier 0 (topology validation, nccl-tests) and Tier 1 (NCCL env var sweep) are
+done. This repo is Tier 2: sharding strategy, placement, and the tokens/GPU
+crossover.
+
+## Quickstart
 
 ```bash
-docker run -it --rm --gpus '"device=0"' -p 8000:8000 -v /opt/gpudata/models:/models vllm/vllm-openai:latest /models/google/gemma-4-31B-it --enforce-eager --served-model-name "gemma4-base" --enable-auto-tool-choice --reasoning-parser gemma4 --tool-call-parser gemma4 --chat-template examples/tool_chat_template_gemma4.jinja --default-chat-template-kwargs '{"enable_thinking": true}'
+conda env create -f env.yaml && conda activate cluster-bench
 ```
 
 ```bash
-docker run -it --rm --gpus '"device=1"' -p 8001:8000 -v /home/songs1/Gemma4-Medical-SFT/train/gemma4-31b-medical-o1:/model vllm/vllm-openai:latest /model --enforce-eager --served-model-name "gemma4-tune" --enable-auto-tool-choice --reasoning-parser gemma4 --tool-call-parser gemma4 --chat-template examples/tool_chat_template_gemma4.jinja --default-chat-template-kwargs '{"enable_thinking": true}'
+python -m cluster_bench.sweep configs/matrix/2a_sharding.yaml --list
+```
+
+```bash
+python -m cluster_bench.sweep configs/matrix/2a_sharding.yaml --hosts localhost node1
+```
+
+```bash
+python -m cluster_bench.report --runs-dir results/runs
+```
+
+The narrow start — DDP ceiling plus the three hpZ variants, about 20 minutes:
+
+```bash
+python -m cluster_bench.sweep configs/matrix/2a_sharding.yaml --only ddp zero3__ zero3-hpz4 zero3-hpz2
+```
+
+## Why a 4B proxy for a 31B target
+
+ZeRO-3 comm is ≈ 6P bytes/GPU/step; compute is ≈ 8·P·tokens FLOPs. **P cancels.**
+The comm:compute ratio depends on *tokens/GPU/step*, not on model size. So a
+dense ~4B model measures the same ratio the 31B run will see — provided it is
+held at the 31B operating point.
+
+That proviso is the single most important thing in this repo:
+
+> `--seq-len 4096 --micro-batch 2` → **8192 tokens/GPU/step**, matching 31B,
+> even though it wastes most of an H200. Let a 4B model run at its natural
+> micro-batch (16+) and everything becomes compute-bound and every difference
+> the study is trying to measure vanishes into noise.
+
+`RunSpec` defaults to exactly this. Don't "fix" it.
+
+Two things the proxy cannot tell you:
+
+1. **The hpZ memory tradeoff.** hpZ=2 keeps a second node-local copy of every
+   parameter shard: +4 GB at 4B (free), +31 GB at 31B (a real decision).
+2. **Large-message efficiency.** 4B gathers ~28 MB/rank against several hundred
+   MB at 31B, so it sits closer to latency-bound and mildly **overstates**
+   hpZ=2's advantage.
+
+What the proxy *adds*: plain **DDP fits** at 4B (8 + 8 + 48 = 64 GB/GPU), giving
+a measured zero-param-comm compute ceiling. Every overhead number here is
+reported against that, not against spec FLOPS.
+
+Before starting, verify the proxy is **dense, not MoE** — expert all-to-all is a
+different comm pattern and invalidates the whole comparison. `modeling.py`
+checks this on every run and aborts; it also records layer count, hidden size,
+vocab size and embedding tying into the results JSON.
+
+## The matrices
+
+| File | What it varies | Cells | Budget |
+|---|---|---|---|
+| `configs/matrix/2a_sharding.yaml` | 9 sharding strategies, 8 GPUs | 9 | ~40 min |
+| `configs/matrix/2b_placement.yaml` | 6 GPU placements × top 3 from 2A | ≤18 | ~1.5 hr |
+| `configs/matrix/2c_tokens.yaml` | 5 token counts × top 3 from 2A | 15 | ~1.5 hr |
+| `configs/matrix/gate_correctness.yaml` | loss curve on real data | 4 | — |
+
+**2A** decomposes ZeRO's cost — `ddp → zero1 → zero2 → zero3` isolates
+optimizer state, then gradients, then parameters — and then varies *only* the
+param-gather scope: flat (global) → hpz4 (node-local) → hpz2 (pair-local).
+
+**2B** is the placement study. The sharp comparison is `one-node`
+(NVLink + PCIe) against `pair-per-node` (NVLink + RoCE, **zero PCIe**): same
+four GPUs' worth of compute, and a direct answer to the PCIe-vs-network
+question. Only possible with a model this small.
+
+**2C** finds where comm stops mattering. This is the most durable output of the
+study — a portable cluster characteristic that transfers to models nobody has
+benchmarked yet.
+
+## Reading the results
+
+Headline metric is `comm_overhead = step_time_config / step_time_ddp - 1`,
+matched to a DDP baseline in the same (placement, tokens) group. `report.py`
+also prints tokens/sec/GPU, step **p50 and p95** — p95 catches stragglers a
+mean would hide — and peak allocated memory.
+
+**Interpretive guard, applied automatically.** hpZ optimizes *only* the
+parameter all-gather. Gradient reduce-scatter stays global, and crosses RoCE, in
+every config. Gathers are roughly 14 of ~21 GB/step, so hpZ's benefit is capped
+at about **2/3** of ZeRO-3's comm. `report.py` warns when a measured win exceeds
+that — a bigger number means something is wrong, usually a cell that quietly
+degraded to a different config.
+
+`placement.validate()` refuses cells that cannot mean what they claim, rather
+than running them. DeepSpeed clamps `zero_hpz_partition_size` to the world size,
+so `hpz=4` on 2 GPUs runs as flat ZeRO-3 while still being labelled hpz4 — those
+cells are skipped with a printed reason.
+
+Run the correctness gate before trusting any timing number. Every config must
+reproduce the reference loss curve at a fixed seed; this is what catches
+packing-mask and loss-normalization bugs, which otherwise present as a config
+that is impressively fast and quietly wrong.
+
+## Layout
+
+```
+src/cluster_bench/
+  config.py       RunSpec — every knob, serialized into each result
+  strategies.py   the 9 sharding configs of Matrix 2A
+  placement.py    the 6 GPU placements of Matrix 2B + cell validation
+  ds_config.py    DeepSpeed config builder (pinned buckets, see below)
+  accel_config.py accelerate launch config builder
+  modeling.py     model load + the dense-not-MoE pre-flight check
+  data.py         synthetic (timing) and real (correctness gate) datasets
+  metrics.py      step timing, p50/p95, tokens/s/GPU, peak memory
+  provenance.py   NCCL/driver/torch versions, git SHA, NCCL env in effect
+  train.py        one cell -> one results JSON
+  sweep.py        matrix driver, SSH-launches peer ranks from node0
+  report.py       aggregate + the interpretive guards above
+configs/
+  env.sh          NCCL tuning (the frozen Tier 1 result)
+  matrix/*.yaml   the matrices
+results/runs/     one JSON per cell
+```
+
+## Config hygiene
+
+`reduce_bucket_size`, `stage3_prefetch_bucket_size` and
+`stage3_param_persistence_threshold` are **pinned**, not `"auto"`. DeepSpeed's
+auto resolves them from the live model's `hidden_size`, which means a 4B proxy
+and the 31B target would move messages 4× apart in size — silently breaking the
+comparison the proxy exists to make. `config.buckets_for_hidden` pins all three
+to what auto *would* have produced at the target's hidden size (5120), so the
+proxy moves target-sized buckets. Override with `--bucket-ref-hidden`.
+
+Also fixed across cells: seed, `NCCL_DEBUG=WARN` for timing runs,
+`wall_clock_breakdown: false`, no checkpointing, no experiment tracker. Step
+time is the **max across ranks**, not rank 0's local view — every rank blocks on
+the next collective anyway, so the slowest rank *is* the step time. The first 20
+steps are discarded (NCCL channel setup, allocator warmup) and 80 are measured.
+
+Timing runs default to a **synthetic pre-tokenized dataset** of exactly
+`seq_len` tokens per sample. bfd packing on real text makes tokens-per-step vary
+between configs, which is fine for training and useless for a controlled
+comparison. The correctness gate uses the real dataset, where packing is exactly
+what needs checking.
+
+## Known limits of this cluster
+
+Documented so they don't get retested:
+
+- **~50B dense is the full-FT ceiling** (16 bytes/param, ~850 GB usable of 1128).
+  70B full FT is impossible (140 GB/GPU against 141 capacity); 31B FSDP
+  HYBRID_SHARD is borderline.
+- No NVSwitch → no NVLS. RoCE → no SHARP in-network reduction.
+- TP > 2, EP/MoE, context-parallel > 2, and deep PP all run, but on this
+  topology they measure the topology rather than the strategy. TP all-reduces
+  are synchronous and unhideable, unlike ZeRO's overlappable gathers.
+- **2 nodes is one hop: this validates a node pair, not a fabric.** No incast,
+  congestion, multi-hop, or ECMP-collision signal. Re-run on expansion.
+- ZeRO++ `zero_quantized_weights` / `zero_quantized_gradients` are wired up and
+  `false`. Untested, and designed for exactly this comm-bound situation —
+  probably worth a look.
+- LoRA and full-FT comm profiles don't cross-apply. Separate matrices if both
+  are needed.
+
+## Confirming at 31B
+
+Three runs — flat ZeRO-3 plus the top two from 2A — checking that (a) memory is
+affordable at 62 → 78 → 93 GB/GPU and (b) the speed ranking survives larger
+messages. If it holds, the 4B proxy is validated and future studies stay small.
+
+```bash
+python -m cluster_bench.train --model-path /opt/gpudata/models/google/gemma-4-31B-it --strategy zero3 --placement full --micro-batch 2 --seq-len 4096
 ```

@@ -1,0 +1,30 @@
+# Matrix 2C -- tokens/GPU crossover. Where does comm stop mattering?
+#
+# The most durable output of the whole study: a portable cluster
+# characteristic that transfers to models nobody has benchmarked yet.
+#
+# Note on the 2048 cell: micro_batch must be >= 1, so 2048 tok/GPU/step is
+# unreachable at seq_len 4096. That cell drops to seq_len 2048 with
+# micro_batch 1. It is therefore the one point on the curve where sequence
+# length -- and so attention's quadratic term -- also changes; read it as
+# indicative rather than as a clean single-variable step.
+#
+# Budget: 15 cells, ~1.5 hr. Edit `strategies` after reading 2A.
+
+defaults:
+  warmup_steps: 20
+  measure_steps: 80
+
+strategies:
+  - ddp
+  - zero3
+  - zero3-hpz2
+
+placements: [full]
+
+tokens_per_gpu:
+  - {seq_len: 2048, tokens_per_gpu: 2048}    # micro_batch 1, see note above
+  - {seq_len: 4096, tokens_per_gpu: 4096}    # micro_batch 1
+  - {seq_len: 4096, tokens_per_gpu: 8192}    # micro_batch 2 -- the 31B point
+  - {seq_len: 4096, tokens_per_gpu: 16384}   # micro_batch 4
+  - {seq_len: 4096, tokens_per_gpu: 32768}   # micro_batch 8

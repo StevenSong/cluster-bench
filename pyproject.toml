@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cluster-bench"
+version = "0.1.0"
+description = "Interconnect and sharding-strategy benchmarking for multi-node GPU clusters"
+requires-python = ">=3.12"
+dynamic = ["dependencies"]
+
+[project.scripts]
+cluster-bench-run = "cluster_bench.train:main"
+cluster-bench-sweep = "cluster_bench.sweep:main"
+cluster-bench-report = "cluster_bench.report:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }

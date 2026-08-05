@@ -30,6 +30,11 @@ export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OMP_NUM_THREADS=8
 
-# ---- first run only ----
-export NCCL_DEBUG=INFO
+# ---- logging ----
+# WARN for timing runs: INFO writes per-collective lines that show up in the
+# p95. The sweep driver exports NCCL_DEBUG after sourcing this file, so
+# `--nccl-debug INFO` on the sweep overrides whatever is set here.
+export NCCL_DEBUG=WARN
+# For topology inspection (Tier 0 work, not timing runs):
+# export NCCL_DEBUG=INFO
 # export NCCL_DEBUG_SUBSYS=INIT,GRAPH,NET

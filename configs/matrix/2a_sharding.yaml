@@ -1,0 +1,28 @@
+# Matrix 2A -- sharding strategy, 8 GPUs, 8192 tok/GPU/step.
+#
+# Rows ddp -> zero1 -> zero2 -> zero3 decompose ZeRO's cost: optimizer state,
+# then gradients, then parameters. zero3-hpz4 and zero3-hpz2 then vary *only*
+# the param-gather scope against flat zero3.
+#
+# Budget: 9 cells, ~40 min.
+# Narrow start: --only ddp zero3__ zero3-hpz4 zero3-hpz2  (~20 min).
+
+defaults:
+  seq_len: 4096
+  micro_batch: 2          # 2 x 4096 = 8192 tok/GPU/step, the pinned control
+  grad_accum: 1
+  warmup_steps: 20
+  measure_steps: 80
+
+placements: [full]
+
+strategies:
+  - ddp                   # compute ceiling / denominator
+  - zero1
+  - zero2
+  - zero3                 # current baseline, flat
+  - zero3-hpz4            # node-local gather
+  - zero3-hpz2            # pair-local (NVLink) gather
+  - fsdp-full             # cross-check vs zero3
+  - fsdp-hybrid           # cross-check vs zero3-hpz4
+  - tp2-zero3

@@ -227,3 +227,9 @@ temp_*
 
 wandb/
 outputs/
+
+# cluster-bench outputs
+results/runs/
+results/generated/
+results/hf/
+sweep_*.json
