@@ -47,7 +47,12 @@ class RunSpec:
     out_dir: Path = Path("results")
 
     # --- model ---
-    model_path: str = "/opt/gpudata/models/Qwen/Qwen3.5-4B"
+    # Dense, full-attention, hidden 2560, ~4B. The full-attention part is not
+    # incidental: Qwen3.5-4B is a hybrid that interleaves gated-delta linear
+    # attention with real attention, and without the fla/causal-conv1d kernels
+    # transformers runs those layers eagerly, inflating compute in every cell
+    # and deflating every comm_overhead. See modeling.check_full_attention.
+    model_path: str = "/opt/gpudata/models/Qwen/Qwen3-4B"
     # Packed sequences cross document boundaries and only flash-attention's
     # varlen path honours the boundary -- under sdpa a token attends back into
     # the previous document. Needs the extra install step in env.yaml. Falling
@@ -59,6 +64,11 @@ class RunSpec:
     # Abort if the model config looks like a mixture of experts: expert
     # all-to-all is a different comm pattern and invalidates the dense proxy.
     require_dense: bool = True
+    # Abort on linear-attention / state-space layers. Unlike the MoE case this
+    # corrupts the compute side rather than the comm side, so it never shows up
+    # as a strange collective -- only as a matrix of overheads that are
+    # uniformly too small. See modeling.check_full_attention.
+    require_full_attention: bool = True
 
     # --- data ---
     # Real text, for timing as well as for the loss-curve correctness gate: it

@@ -1,10 +1,31 @@
-"""Model loading plus the pre-flight check the proxy study depends on.
+"""Model loading plus the pre-flight checks the proxy study depends on.
 
 The 4B proxy is only a valid stand-in for dense 31B because ZeRO-3 comm
 (~6P bytes/GPU/step) and compute (~8*P*tokens FLOPs) both scale with P, so P
-cancels and the comm:compute ratio is set by tokens/GPU/step. That argument
-collapses if the proxy is a mixture of experts -- expert all-to-all is a
-different comm pattern with no counterpart in the dense target.
+cancels and the comm:compute ratio is set by tokens/GPU/step. Two architecture
+choices break that argument, and each gets a guard here:
+
+* **Mixture of experts.** Expert all-to-all is a different comm pattern with no
+  counterpart in the dense target. Breaks the numerator.
+
+* **Linear attention** (gated delta, Mamba, RWKV, and the hybrids that
+  interleave such layers with real attention). Breaks the *denominator*, which
+  is the subtler failure. Comm is untouched -- ZeRO-3 gathers bytes and does
+  not care what the layer computes -- but the fused kernels live in
+  `flash-linear-attention` / `causal-conv1d`, neither of which this repo
+  installs, so transformers silently falls back to an eager chunked recurrence
+  and inflates compute in every cell by the same large factor. Step times all
+  rise together, `comm_overhead` is a ratio, and every overhead in Matrix 2A
+  gets divided toward zero. The matrix stays correctly *ordered* while its
+  magnitudes go quietly wrong, and Matrix 2C -- whose entire output is the
+  tokens/GPU where comm stops mattering -- reports a crossover well below the
+  truth. It is the same contamination as letting the 4B run at its natural
+  micro-batch, arriving through a different door.
+
+  The fallback announces itself only as a transformers warning about a "fast
+  path", buried in whatever else rank 0 prints. Hence a hard guard: the study
+  wants a plain dense full-attention model, and anything else should stop the
+  run rather than land in a results JSON.
 """
 
 from __future__ import annotations
@@ -25,6 +46,33 @@ _MOE_KEYS = (
     "moe_layer_freq",
 )
 
+# Config keys that only exist on a model carrying linear-attention or
+# state-space layers. Presence of any one of them is enough.
+_LINEAR_ATTN_KEYS = (
+    "linear_attn_config",
+    "linear_conv_kernel_dim",
+    "linear_key_head_dim",
+    "linear_num_key_heads",
+    "linear_num_value_heads",
+    "mamba_d_state",
+    "mamba_expand",
+    "mamba_n_heads",
+    "state_size",
+    "conv_kernel",
+    "attn_layer_indices",
+    "full_attention_interval",
+)
+
+# `layer_types` is the modern spelling: one entry per layer. Softmax attention
+# comes in several flavours and all of them are fine here -- sliding-window and
+# chunked attention still run through the flash/sdpa kernels and still have a
+# counterpart in the dense target. Anything outside this set is either linear
+# attention or something new, and both should stop the run: a name we do not
+# recognise is exactly the case where a silent eager fallback would hide.
+_SOFTMAX_LAYER_TYPES = frozenset(
+    {"full_attention", "sliding_attention", "chunked_attention"}
+)
+
 
 def describe(model_path: str) -> dict[str, Any]:
     """Architecture facts worth recording with every run."""
@@ -34,8 +82,26 @@ def describe(model_path: str) -> dict[str, Any]:
     moe_evidence = {
         k: getattr(text_cfg, k) for k in _MOE_KEYS if getattr(text_cfg, k, None)
     }
+
+    layer_types = getattr(text_cfg, "layer_types", None)
+    linear_evidence = {
+        k: getattr(text_cfg, k) for k in _LINEAR_ATTN_KEYS if getattr(text_cfg, k, None)
+    }
+    non_softmax = sorted(set(layer_types or []) - _SOFTMAX_LAYER_TYPES)
+    if non_softmax:
+        linear_evidence["layer_types"] = non_softmax
+
     return {
         "model_type": getattr(cfg, "model_type", None),
+        # Counts, not the raw per-layer list: a 36-entry array of strings in
+        # every results JSON buys nothing that {"full_attention": 36} does not.
+        "layer_type_counts": (
+            {t: layer_types.count(t) for t in sorted(set(layer_types))}
+            if layer_types
+            else None
+        ),
+        "is_linear_attention": bool(linear_evidence),
+        "linear_attention_evidence": linear_evidence,
         "num_hidden_layers": getattr(text_cfg, "num_hidden_layers", None),
         "hidden_size": getattr(text_cfg, "hidden_size", None),
         "intermediate_size": getattr(text_cfg, "intermediate_size", None),
@@ -58,6 +124,31 @@ def check_dense(info: dict[str, Any], model_path: str) -> None:
             "measuring the wrong thing. Pick a dense ~4B, or pass --no-require-dense\n"
             "if you have decided to measure MoE deliberately."
         )
+
+
+def check_full_attention(info: dict[str, Any], model_path: str) -> None:
+    """Refuse hybrids and linear-attention models. See the module docstring.
+
+    Cheap to check and expensive to miss: the symptom is a one-line transformers
+    warning, and the consequence is a whole matrix of plausible-looking overhead
+    numbers that are all too small.
+    """
+    if not info["is_linear_attention"]:
+        return
+    raise SystemExit(
+        f"{model_path} has linear-attention or state-space layers "
+        f"({info['linear_attention_evidence']}).\n"
+        "Those layers have no fused kernel in this environment, so transformers\n"
+        "falls back to an eager implementation -- the giveaway is its warning\n"
+        "about a 'fast path' not being available. That inflates compute in every\n"
+        "cell equally, and since comm_overhead is a ratio of step times, it\n"
+        "shrinks every overhead in the matrix toward zero and moves Matrix 2C's\n"
+        "crossover below the truth. Comm itself is unaffected, which is what\n"
+        "makes the corruption hard to spot in the results.\n"
+        "Use a dense, full-attention ~4B instead. If you have installed\n"
+        "flash-linear-attention and causal-conv1d on *every* node and want to\n"
+        "measure this architecture deliberately, pass --no-require-full-attention."
+    )
 
 
 def check_attn_available(attn_impl: str) -> None:
@@ -89,6 +180,8 @@ def load(spec: RunSpec) -> tuple[Any, Any, dict[str, Any]]:
     info = describe(spec.model_path)
     if spec.require_dense:
         check_dense(info, spec.model_path)
+    if spec.require_full_attention:
+        check_full_attention(info, spec.model_path)
 
     tokenizer = AutoTokenizer.from_pretrained(spec.model_path)
     model = AutoModelForCausalLM.from_pretrained(

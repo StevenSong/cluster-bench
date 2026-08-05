@@ -91,6 +91,31 @@ What the proxy *adds*: plain **DDP fits** at 4B (8 + 8 + 48 = 64 GB/GPU), giving
 a measured zero-param-comm compute ceiling. Every overhead number here is
 reported against that, not against spec FLOPS.
 
+### Two architectures that break the argument
+
+The proxy must be **dense** and **full-attention**. `modeling.py` checks both
+before the weights load and stops the run rather than produce a results file.
+
+**Mixture of experts** breaks the numerator: expert all-to-all is a comm pattern
+the dense target does not have.
+
+**Linear attention** — gated delta, Mamba, RWKV, and the hybrids that interleave
+such layers with real attention — breaks the denominator, which is harder to
+notice. The fused kernels live in `flash-linear-attention` and `causal-conv1d`,
+neither of which this repo installs, so transformers falls back to an eager
+chunked recurrence. Comm is completely unaffected — ZeRO-3 gathers bytes and
+does not care what a layer computes — but compute rises in every cell by the
+same factor, and `comm_overhead` is a ratio of step times. Every overhead in
+Matrix 2A gets divided toward zero while the *ranking* survives intact, and
+Matrix 2C reports its crossover at a lower tokens/GPU than the truth. Nothing in
+the results looks wrong.
+
+The only symptom is a transformers warning about a "fast path" not being
+available. Do not dismiss it; it means the number you are about to record is
+smaller than the real one. `--no-require-full-attention` exists for measuring
+such a model deliberately, and is only honest if fla and causal-conv1d are
+installed on **every** node.
+
 Before starting, verify the proxy is **dense, not MoE** — expert all-to-all is a
 different comm pattern and invalidates the whole comparison. `modeling.py`
 checks this on every run and aborts; it also records layer count, hidden size,
