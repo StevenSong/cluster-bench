@@ -259,6 +259,25 @@ def run_cell(cell: Cell, args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _matches(cell: Cell, keys: list[str]) -> bool:
+    """Select cells by strategy or placement name, matched exactly.
+
+    Plain substring matching on run_id is too loose to be safe: `zero3` is a
+    substring of `tp2-zero3`, so the documented narrow-start invocation would
+    quietly pull in a TP cell and turn a 4-cell run into 5. Strategy and
+    placement names therefore match exactly; anything else falls back to
+    substring so tags and token counts stay selectable.
+    """
+    known = set(strategies_mod.STRATEGIES) | set(placement_mod.PLACEMENTS)
+    for k in keys:
+        if k in known:
+            if k in (cell.strategy.name, cell.place.name):
+                return True
+        elif k in cell.run_id:
+            return True
+    return False
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("matrix", type=Path, help="configs/matrix/*.yaml")
@@ -272,7 +291,8 @@ def main() -> None:
     ap.add_argument("--nccl-debug", default="WARN")
     ap.add_argument("--peer-timeout", type=float, default=300.0)
     ap.add_argument("--only", nargs="*", default=None,
-                    help="run only cells whose run_id contains one of these")
+                    help="run only these strategies/placements (exact names), "
+                         "or cells whose run_id contains the given text")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--list", action="store_true", help="print cells and exit")
     # RunSpec's own flags (--strategy, --seq-len, --model-path, ...) act as the
@@ -287,7 +307,7 @@ def main() -> None:
     cells, skipped = expand(matrix, base)
 
     if args.only:
-        cells = [c for c in cells if any(k in c.run_id for k in args.only)]
+        cells = [c for c in cells if _matches(c, args.only)]
 
     needed = max((c.place.num_machines for c in cells), default=1)
     if len(args.hosts) < needed:

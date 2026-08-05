@@ -38,7 +38,7 @@ python -m cluster_bench.report --runs-dir results/runs
 The narrow start — DDP ceiling plus the three hpZ variants, about 20 minutes:
 
 ```bash
-python -m cluster_bench.sweep configs/matrix/2a_sharding.yaml --only ddp zero3__ zero3-hpz4 zero3-hpz2
+python -m cluster_bench.sweep configs/matrix/2a_sharding.yaml --only ddp zero3 zero3-hpz4 zero3-hpz2
 ```
 
 ## Why a 4B proxy for a 31B target
