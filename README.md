@@ -24,6 +24,18 @@ conda env create -f env.yaml && conda activate cluster-bench
 ```
 
 ```bash
+pip install -r requirements-flash.txt --no-build-isolation
+```
+
+flash-attn is a second command because it imports torch at build time and so
+needs `--no-build-isolation`, which a requirements file cannot carry. It is not
+optional: packed sequences cross document boundaries and only flash-attention's
+varlen path honours the boundary. From PyPI it compiles CUDA kernels — tens of
+minutes, `MAX_JOBS=4` if the node swaps — so prefer the matching prebuilt wheel
+from the project's GitHub releases. Both commands run on **every** node, and
+`sweep.py`'s preflight checks each peer can import it before the first cell.
+
+```bash
 python -m cluster_bench.sweep configs/matrix/2a_sharding.yaml --list
 ```
 
@@ -197,11 +209,14 @@ matrix sees byte-identical text in identical order.
 Two consequences worth knowing:
 
 - Packed sequences cross document boundaries, and only flash-attention's varlen
-  path honours the boundary. Under the default `sdpa` a token attends back into
-  the previous document. FLOPs are unchanged, so step times — the thing measured
-  here — are unaffected, and the gate still holds because every cell is
-  contaminated identically. The absolute loss is not a training loss. Runs
-  record this as `dataset.packed_attention_crosses_documents`.
+  path honours the boundary — which is why `attn_impl` defaults to
+  `flash_attention_2` and flash-attn is a required install. `--attn-impl sdpa`
+  is a supported fallback if a node can't build it: FLOPs are unchanged, so step
+  times — the thing measured here — are unaffected, and the gate still holds
+  because every cell is contaminated identically. But a token attends back into
+  the previous document, so the absolute loss is no longer a training loss. Runs
+  record this as `dataset.packed_attention_crosses_documents`, and `report.py`
+  warns if flash-attn versions differ across cells.
 - `--dataset synthetic` still generates pre-tokenized random ids of exactly
   `seq_len`. Keep it for node bring-up before the corpus is staged, and for
   separating a data-path problem from a comm problem.

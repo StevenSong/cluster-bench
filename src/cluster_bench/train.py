@@ -69,12 +69,13 @@ def run(spec: config.RunSpec) -> dict[str, Any]:
     _log(f"dataset={spec.dataset} samples={len(dataset)} synthetic={is_synthetic}")
 
     # Packed sequences cross document boundaries, and only the flash-attention
-    # varlen path honours the boundary. Under sdpa a token attends back into
-    # the previous document. FLOPs are identical either way, so step times --
-    # what this repo measures -- are unaffected, and the loss-curve gate still
-    # compares configs against each other because every cell is contaminated
-    # identically. It does mean the absolute loss is not a training loss.
-    # Recorded so a future reader does not mistake it for one.
+    # varlen path honours the boundary -- which is why attn_impl defaults to
+    # flash_attention_2. Reaching here means someone opted out of it. FLOPs are
+    # identical either way, so step times -- what this repo measures -- are
+    # unaffected, and the loss-curve gate still compares configs against each
+    # other because every cell is contaminated identically. It does mean the
+    # absolute loss is not a training loss. Recorded so a future reader does not
+    # mistake it for one.
     packed_attn_leak = (
         spec.packing and not is_synthetic and "flash" not in spec.attn_impl
     )
@@ -82,7 +83,8 @@ def run(spec: config.RunSpec) -> dict[str, Any]:
         _log(
             f"NOTE: packing with attn_impl={spec.attn_impl!r} -- attention crosses "
             "packed document boundaries. Step times are unaffected; absolute loss "
-            "is not a training loss. Use flash_attention_2 or --no-packing to avoid."
+            "is not a training loss. Drop --attn-impl to get the default "
+            "flash_attention_2 back."
         )
 
     dataset_kwargs: dict[str, Any] = {"add_special_tokens": False}

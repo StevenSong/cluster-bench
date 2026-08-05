@@ -81,7 +81,18 @@ def _versions() -> dict[str, str | None]:
     import importlib.metadata as md
 
     out: dict[str, str | None] = {}
-    for pkg in ("transformers", "trl", "accelerate", "deepspeed", "datasets", "liger-kernel"):
+    # flash-attn is installed out of band (see requirements-flash.txt), so it is
+    # the package most likely to differ between two nodes -- and a matrix run
+    # across two attention kernels is not a matrix.
+    for pkg in (
+        "transformers",
+        "trl",
+        "accelerate",
+        "deepspeed",
+        "datasets",
+        "liger-kernel",
+        "flash-attn",
+    ):
         try:
             out[pkg] = md.version(pkg)
         except md.PackageNotFoundError:

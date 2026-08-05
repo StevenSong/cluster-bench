@@ -48,7 +48,13 @@ class RunSpec:
 
     # --- model ---
     model_path: str = "/opt/gpudata/models/Qwen/Qwen3.5-4B"
-    attn_impl: str = "sdpa"
+    # Packed sequences cross document boundaries and only flash-attention's
+    # varlen path honours the boundary -- under sdpa a token attends back into
+    # the previous document. Needs the extra install step in env.yaml. Falling
+    # back to `sdpa` is supported and leaves step times intact (identical
+    # FLOPs), but the absolute loss stops being a training loss; the run
+    # records that it happened.
+    attn_impl: str = "flash_attention_2"
     dtype: str = "bfloat16"
     # Abort if the model config looks like a mixture of experts: expert
     # all-to-all is a different comm pattern and invalidates the dense proxy.

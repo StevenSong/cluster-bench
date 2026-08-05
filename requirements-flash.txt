@@ -1,0 +1,23 @@
+# FlashAttention, installed separately from requirements.txt on purpose.
+#
+# Two reasons it cannot live in the main file:
+#
+#   1. flash-attn's setup.py imports torch at build time, so it needs
+#      `--no-build-isolation` -- and that is a global pip option, not one a
+#      requirements file is allowed to carry.
+#   2. It must therefore be installed *after* torch, not resolved alongside it.
+#
+#     pip install -r requirements.txt
+#     pip install -r requirements-flash.txt --no-build-isolation
+#
+# PyPI ships an sdist only, so the command above compiles CUDA kernels: tens of
+# minutes and a lot of RAM (cap the parallelism with MAX_JOBS=4 if the node
+# starts swapping). The fast path is the matching prebuilt wheel from the
+# project's GitHub releases -- pick the one whose torch, CUDA, cxx11abi and
+# cp312 tags match this environment and `pip install` the URL directly.
+#
+# The pin is a floor, not an exact version: the wheel has to match whatever
+# torch/CUDA build the node actually has. Once a build is known good on this
+# cluster, pin it exactly here -- a benchmark comparing cells across two
+# attention kernels is not a benchmark.
+flash-attn>=2.8.0

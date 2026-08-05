@@ -189,6 +189,16 @@ def provenance_spread(runs: list[dict[str, Any]]) -> list[str]:
         seen = {str(r.get("provenance", {}).get(k)) for r in runs}
         if len(seen) > 1:
             notes.append(f"mixed {k} across runs: {sorted(seen)}")
+
+    # Everything else is pinned in requirements.txt; flash-attn is installed out
+    # of band per node, so it is the one that can drift. Two cells on different
+    # attention kernels are not comparable.
+    fa = {
+        str(r.get("provenance", {}).get("packages", {}).get("flash-attn"))
+        for r in runs
+    }
+    if len(fa) > 1:
+        notes.append(f"mixed flash-attn across runs: {sorted(fa)}")
     shas = {
         r.get("provenance", {}).get("git", {}).get("sha") for r in runs
     }

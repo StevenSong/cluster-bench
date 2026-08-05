@@ -60,7 +60,32 @@ def check_dense(info: dict[str, Any], model_path: str) -> None:
         )
 
 
+def check_attn_available(attn_impl: str) -> None:
+    """Fail on the flag, not fifteen seconds later on the weights.
+
+    A sweep that dies partway through loading the model on rank 3 of an 8-rank
+    cell leaves the other ranks in the rendezvous until it times out, and the
+    message arrives buried in seven copies of a traceback. flash-attn is also
+    the one dependency env.yaml cannot install by itself, so it is the one most
+    likely to be missing on a freshly staged peer node.
+    """
+    if "flash" not in attn_impl:
+        return
+    try:
+        import flash_attn  # noqa: F401
+    except ImportError as e:
+        raise SystemExit(
+            f"attn_impl={attn_impl!r} but flash-attn is not importable ({e}).\n"
+            "It is a separate install step, on every node:\n"
+            "    pip install -r requirements-flash.txt --no-build-isolation\n"
+            "Or pass --attn-impl sdpa: step times are unaffected (identical\n"
+            "FLOPs) but attention will cross packed document boundaries and the\n"
+            "absolute loss stops being a training loss."
+        ) from e
+
+
 def load(spec: RunSpec) -> tuple[Any, Any, dict[str, Any]]:
+    check_attn_available(spec.attn_impl)
     info = describe(spec.model_path)
     if spec.require_dense:
         check_dense(info, spec.model_path)

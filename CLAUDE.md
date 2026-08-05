@@ -99,10 +99,18 @@ tokens/step drifts between cells, which silently contaminates every overhead
 number. `metrics` counts the tokens that reach the model and `report.check_token_control`
 fails any cell drifting >1% from nominal.
 
-Packed sequences cross document boundaries and `sdpa` does not honour the
-boundary (no flash-attn in requirements). FLOPs are identical, so step times are
-unaffected and the gate still compares cells to each other; absolute loss is not
-a training loss. Recorded per run as `dataset.packed_attention_crosses_documents`.
+Packed sequences cross document boundaries and only flash-attention's varlen
+path honours the boundary, so `attn_impl` defaults to `flash_attention_2` and
+**flash-attn is back as a dependency** — in `requirements-flash.txt`, a separate
+`pip install ... --no-build-isolation` step because it imports torch at build
+time. Every node needs it; `sweep.py`'s preflight checks each peer, and
+`provenance` records the version so `report.py` catches two nodes on different
+kernels.
+
+`--attn-impl sdpa` is a supported fallback: FLOPs are identical so step times are
+unaffected and the gate still compares cells to each other, but absolute loss is
+not a training loss. Recorded per run as
+`dataset.packed_attention_crosses_documents`.
 
 `--dataset synthetic` remains for node bring-up and for isolating a data-path
 problem from a comm problem.
@@ -174,5 +182,12 @@ of this has executed):
   still calls it positionally as `(model, inputs, num_items_in_batch)`.
 - Proxy model still unverified: check Qwen3.5-4B is dense, not MoE.
   `modeling.check_dense` aborts the run if it isn't.
-- `flash-attn`, `wandb`, `openai` dropped from requirements (unused by the
-  benchmark; `--attn-impl` defaults to `sdpa`).
+- `wandb`, `openai` dropped from requirements (unused by the benchmark).
+  `flash-attn` was dropped too, then **restored** when timing moved to real
+  packed data — see the data section above. It lives in
+  `requirements-flash.txt`, not `requirements.txt`.
+- **flash-attn build on the cluster**: PyPI ships an sdist, so `pip install`
+  compiles kernels. Find the prebuilt wheel matching torch 2.9.1 / cu130 /
+  cp312 / cxx11abi from the GitHub releases, confirm it imports on both nodes,
+  then pin that exact version in `requirements-flash.txt` — the floor pin there
+  is a placeholder.

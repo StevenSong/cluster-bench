@@ -247,9 +247,16 @@ def preflight(host: str, args: argparse.Namespace) -> None:
     activate shows up as rank 0 hanging in the rendezvous for the full NCCL
     timeout, once per cell, with the real error buried in a rank log.
     """
+    checks = ["import accelerate, cluster_bench"]
+    if "flash" in args.attn_impl:
+        # The one dependency env.yaml cannot install by itself, so the one most
+        # likely to be missing on a freshly staged peer. Print the version too:
+        # two nodes on different attention kernels is the same class of problem
+        # as two nodes on different NCCL builds.
+        checks.append("import flash_attn; print('flash_attn', flash_attn.__version__)")
     parts = ([args.activate] if args.activate else []) + [
         f"cd {shlex.quote(str(args.remote_dir))}",
-        "python -c 'import accelerate, cluster_bench'",
+        f"python -c {shlex.quote('; '.join(checks))}",
         "command -v accelerate",
     ]
     p = subprocess.run(
