@@ -7,7 +7,23 @@ name = "cluster-bench"
 version = "0.1.0"
 description = "Interconnect and sharding-strategy benchmarking for multi-node GPU clusters"
 requires-python = ">=3.12"
-dynamic = ["dependencies"]
+
+# Deliberately no `dependencies` / `dynamic = ["dependencies"]`.
+#
+# requirements.txt is the source of truth for the environment and cannot be
+# read as a dependency list: `--extra-index-url` is a pip option, not a PEP 508
+# requirement, so setuptools fails to parse it.
+#
+# Declaring the pins here instead would be worse than the duplication. Torch
+# must come from the cu130 index; if `pip install -e .` could resolve
+# `torch==2.9.1` on its own it would take the default PyPI wheel, quietly
+# swapping the bundled NCCL for one whose topology detection is wrong on this
+# fabric -- the exact failure the nvidia-nccl-cu13 pin exists to prevent.
+#
+# So install the environment first, then this package:
+#     pip install -r requirements.txt
+#     pip install -e . --no-deps
+# env.yaml does both in that order.
 
 [project.scripts]
 cluster-bench-run = "cluster_bench.train:main"
@@ -16,6 +32,3 @@ cluster-bench-report = "cluster_bench.report:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.dynamic]
-dependencies = { file = ["requirements.txt"] }
