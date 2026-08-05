@@ -92,6 +92,12 @@ def _versions() -> dict[str, str | None]:
         "datasets",
         "liger-kernel",
         "flash-attn",
+        # Not dependencies: modeling.check_full_attention refuses the models
+        # that need them. Recorded anyway because the one way they can appear
+        # is --no-require-full-attention, which is exactly the run where a node
+        # missing them silently falls back to eager and skews the cell.
+        "flash-linear-attention",
+        "causal-conv1d",
     ):
         try:
             out[pkg] = md.version(pkg)

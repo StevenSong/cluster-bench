@@ -27,10 +27,24 @@ README.md carries the full operating manual. This file is the standing plan.
 - Tier 1 (NCCL env var sweep) — DONE
 - **Tier 2 (sharding strategy) — this is the current work**
 
-## Proxy model: dense ~4B (candidate: Qwen3.5-4B)
-**Verify before starting: dense not MoE, layer count, hidden size, vocab size, tied embeddings.**
-If it's MoE the study is invalid as a dense-31B proxy (expert all-to-all is a different
-comm pattern). Any dense ~4B substitutes with no other plan changes.
+## Proxy model: dense, full-attention ~4B (Qwen3-4B)
+**Verify before starting: dense not MoE, full attention not hybrid, layer count, hidden
+size, vocab size, tied embeddings.** Two architectures invalidate the proxy, and
+`modeling.py` aborts the run on each:
+- **MoE** — expert all-to-all is a different comm pattern with no counterpart in the
+  dense target. Breaks the numerator.
+- **Linear attention / hybrid** — breaks the *denominator*, and does it silently.
+  fla/causal-conv1d aren't installed, so those layers run eagerly and inflate compute
+  in every cell equally; `comm_overhead` is a ratio, so every number in 2A shrinks
+  toward zero and 2C's crossover lands below the truth. Comm is untouched, so nothing
+  looks wrong in the results.
+
+Any dense full-attention ~4B substitutes with no other plan changes.
+
+**Was Qwen3.5-4B** (changed 2026-08-05): it is a gated-delta hybrid, and it announced
+itself only as a transformers warning about an unavailable "fast path". Qwen3-4B is
+dense full attention at the same hidden size (2560), so `bucket_ref_hidden` and every
+other pinned number carry over unchanged.
 
 ### Why a 4B proxy is valid
 ZeRO-3 comm ≈ 6P bytes/GPU/step; compute ≈ 8·P·tokens FLOPs. **P cancels** — the
@@ -180,8 +194,11 @@ of this has executed):
 - **`_BenchSFTTrainer.training_step` signature**: subclassed in `train.py` to
   count tokens; passes `*args/**kwargs` through, but confirm transformers 5.5
   still calls it positionally as `(model, inputs, num_items_in_batch)`.
-- Proxy model still unverified: check Qwen3.5-4B is dense, not MoE.
-  `modeling.check_dense` aborts the run if it isn't.
+- **Qwen3-4B must be staged at `/opt/gpudata/models/Qwen/Qwen3-4B` on both nodes** —
+  the new default path, not yet confirmed present. `modeling.check_dense` and
+  `modeling.check_full_attention` abort the run if the model at that path is MoE or
+  carries linear-attention layers; `describe()` records `layer_type_counts` per run so
+  `report.py` has the evidence too.
 - `wandb`, `openai` dropped from requirements (unused by the benchmark).
   `flash-attn` was dropped too, then **restored** when timing moved to real
   packed data — see the data section above. It lives in
