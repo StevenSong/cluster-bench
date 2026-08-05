@@ -32,16 +32,25 @@ def build(
         "rdzv_backend": "c10d",
         "same_network": True,
         "use_cpu": False,
-        "mixed_precision": "bf16",
     }
 
     if strategy.backend == "ddp":
         cfg["distributed_type"] = "MULTI_GPU"
+        cfg["mixed_precision"] = "bf16"
 
     elif strategy.backend == "deepspeed":
         if ds_config_path is None:
             raise ValueError("deepspeed strategies need a ds_config_path")
         cfg["distributed_type"] = "DEEPSPEED"
+        # No top-level `mixed_precision` here, deliberately. With a
+        # `deepspeed_config_file`, accelerate treats precision set in the
+        # accelerate config as a conflicting duplicate: it flags the field in
+        # ACCELERATE_CONFIG_DS_FIELDS and DeepSpeedPlugin then refuses to
+        # start ("the following accelerate config variables will be
+        # ignored"). Spelling it "no" does not help -- any value present
+        # trips it; the key has to be absent. bf16 comes from the DeepSpeed
+        # config's `bf16.enabled` instead, which is where DeepSpeed reads it
+        # from regardless.
         cfg["deepspeed_config"] = {
             "deepspeed_config_file": str(ds_config_path),
             # Stage-3 needs zero.Init at construction or the model is
@@ -52,6 +61,7 @@ def build(
 
     elif strategy.backend == "fsdp":
         cfg["distributed_type"] = "FSDP"
+        cfg["mixed_precision"] = "bf16"
         fsdp: dict[str, Any] = {
             "fsdp_version": 2,
             "fsdp_reshard_after_forward": strategy.fsdp_reshard_after_forward,
