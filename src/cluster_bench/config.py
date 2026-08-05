@@ -55,15 +55,24 @@ class RunSpec:
     require_dense: bool = True
 
     # --- data ---
-    # "synthetic" generates exactly seq_len tokens per sample with no
-    # tokenizer variance -- the right choice for timing. A real dataset path
-    # is for the loss-curve correctness gate.
-    dataset: str = "synthetic"
+    # Real text, for timing as well as for the loss-curve correctness gate: it
+    # is what the 31B target actually trains on, so the tokenizer's length
+    # distribution, the packing path and the completion mask are exercised by
+    # the reported numbers rather than only by the gate. The control survives
+    # because `packing_strategy` is `wrapped` -- see below and data.py.
+    #
+    # Pass `--dataset synthetic` for pre-tokenized random ids of exactly
+    # seq_len: no corpus needed, useful for node bring-up and for separating a
+    # data-path problem from a comm problem.
+    dataset: str = "/opt/gpudata/medical-o1-reasoning-SFT"
     dataset_config: str = "en"
     dataset_split: str = "train"
     prompt_field: str = "Question"
     reasoning_field: str = "Complex_CoT"
     completion_field: str = "Response"
+    # 0 = size automatically from warmup + measure steps. A cell must not spend
+    # its time tokenizing a corpus it will never reach.
+    dataset_num_samples: int = 0
 
     # --- THE critical control -------------------------------------------
     # per_device_train_batch_size * max_length = tokens/GPU/step. Pinned to
@@ -79,7 +88,12 @@ class RunSpec:
 
     # --- trainer ---
     packing: bool = True
-    packing_strategy: str = "bfd"
+    # "wrapped", not "bfd". bfd emits sequences of *at most* max_length, so on
+    # real text the tokens in a step -- the denominator of every throughput
+    # number -- would drift between cells and the pinned control below would
+    # not hold. wrapped concatenates and cuts at exactly max_length, so
+    # micro_batch * seq_len stays the literal token count.
+    packing_strategy: str = "wrapped"
     padding_free: bool = True
     liger: bool = True
     gradient_checkpointing: bool = True

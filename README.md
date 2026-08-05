@@ -148,7 +148,7 @@ src/cluster_bench/
   ds_config.py    DeepSpeed config builder (pinned buckets, see below)
   accel_config.py accelerate launch config builder
   modeling.py     model load + the dense-not-MoE pre-flight check
-  data.py         synthetic (timing) and real (correctness gate) datasets
+  data.py         real dataset (timing + gate) + a synthetic escape hatch
   metrics.py      step timing, p50/p95, tokens/s/GPU, peak memory
   provenance.py   NCCL/driver/torch versions, git SHA, NCCL env in effect
   train.py        one cell -> one results JSON
@@ -176,11 +176,35 @@ time is the **max across ranks**, not rank 0's local view — every rank blocks 
 the next collective anyway, so the slowest rank *is* the step time. The first 20
 steps are discarded (NCCL channel setup, allocator warmup) and 80 are measured.
 
-Timing runs default to a **synthetic pre-tokenized dataset** of exactly
-`seq_len` tokens per sample. bfd packing on real text makes tokens-per-step vary
-between configs, which is fine for training and useless for a controlled
-comparison. The correctness gate uses the real dataset, where packing is exactly
-what needs checking.
+Timing runs and the correctness gate both use the **real dataset**, so the
+tokenizer's length distribution, the packing path and the completion mask are
+exercised by the numbers being reported rather than only by the gate.
+
+Real text costs the control, and `packing_strategy` is how it is bought back.
+bfd emits sequences of *at most* `max_length`, so tokens-per-step — the
+denominator of every throughput number — would drift between cells. **`wrapped`**
+concatenates the tokenized corpus and cuts it into chunks of *exactly*
+`max_length`, so `micro_batch × seq_len` stays the literal token count. The
+tokens that actually reach the model are counted per step and reported as
+`tokens_per_gpu_step_measured`; `report.py` flags any cell that drifts more than
+1% from nominal, and any comparison group whose cells disagree.
+
+Each cell loads only as much of the split as its step count needs (`--dataset-num-samples`
+to override) — a 40-second cell should not spend its time tokenizing 25k
+examples. Sampling is the head of the split, not a shuffle, so every cell in a
+matrix sees byte-identical text in identical order.
+
+Two consequences worth knowing:
+
+- Packed sequences cross document boundaries, and only flash-attention's varlen
+  path honours the boundary. Under the default `sdpa` a token attends back into
+  the previous document. FLOPs are unchanged, so step times — the thing measured
+  here — are unaffected, and the gate still holds because every cell is
+  contaminated identically. The absolute loss is not a training loss. Runs
+  record this as `dataset.packed_attention_crosses_documents`.
+- `--dataset synthetic` still generates pre-tokenized random ids of exactly
+  `seq_len`. Keep it for node bring-up before the corpus is staged, and for
+  separating a data-path problem from a comm problem.
 
 ## Known limits of this cluster
 

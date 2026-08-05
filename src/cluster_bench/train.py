@@ -64,8 +64,26 @@ def run(spec: config.RunSpec) -> dict[str, Any]:
     )
 
     dataset, is_synthetic = data.build(
-        spec, model_info["vocab_size"] or 32000, world_size
+        spec, tokenizer, model_info["vocab_size"] or 32000, world_size
     )
+    _log(f"dataset={spec.dataset} samples={len(dataset)} synthetic={is_synthetic}")
+
+    # Packed sequences cross document boundaries, and only the flash-attention
+    # varlen path honours the boundary. Under sdpa a token attends back into
+    # the previous document. FLOPs are identical either way, so step times --
+    # what this repo measures -- are unaffected, and the loss-curve gate still
+    # compares configs against each other because every cell is contaminated
+    # identically. It does mean the absolute loss is not a training loss.
+    # Recorded so a future reader does not mistake it for one.
+    packed_attn_leak = (
+        spec.packing and not is_synthetic and "flash" not in spec.attn_impl
+    )
+    if packed_attn_leak:
+        _log(
+            f"NOTE: packing with attn_impl={spec.attn_impl!r} -- attention crosses "
+            "packed document boundaries. Step times are unaffected; absolute loss "
+            "is not a training loss. Use flash_attention_2 or --no-packing to avoid."
+        )
 
     dataset_kwargs: dict[str, Any] = {"add_special_tokens": False}
     # Samples are already exactly seq_len tokens; packing them again would
@@ -126,7 +144,15 @@ def run(spec: config.RunSpec) -> dict[str, Any]:
         sync_each_step=spec.sync_each_step,
     )
 
-    trainer = SFTTrainer(
+    # Tokens are counted from the batch the trainer is about to run, which is
+    # the only place they are visible in the main process -- a callback never
+    # sees the inputs, and the collator runs in a dataloader worker.
+    class _BenchSFTTrainer(SFTTrainer):
+        def training_step(self, model, inputs, *args, **kwargs):  # noqa: ANN001
+            bench.count(inputs)
+            return super().training_step(model, inputs, *args, **kwargs)
+
+    trainer = _BenchSFTTrainer(
         model=model,
         args=args,
         train_dataset=dataset,
@@ -162,7 +188,14 @@ def run(spec: config.RunSpec) -> dict[str, Any]:
         },
         "spec": spec.to_dict(),
         "model": model_info,
-        "dataset": {"source": spec.dataset, "synthetic": is_synthetic},
+        "dataset": {
+            "source": spec.dataset,
+            "synthetic": is_synthetic,
+            "num_samples": len(dataset),
+            "packing": args.packing,
+            "packing_strategy": spec.packing_strategy,
+            "packed_attention_crosses_documents": packed_attn_leak,
+        },
         "wall_time_s": wall,
         **bench.summary(world_size),
     }

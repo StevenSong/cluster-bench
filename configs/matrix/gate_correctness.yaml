@@ -5,19 +5,17 @@
 # bugs, which otherwise present as a config that is impressively fast and
 # quietly wrong.
 #
-# Uses the real dataset (not synthetic) because a packing-mask bug is
-# invisible on pre-tokenized fixed-length samples -- there is nothing to pack.
+# The dataset and packing strategy are inherited rather than pinned here, so
+# the gate exercises exactly the data path the timing matrices run. A gate on a
+# path nothing else uses proves nothing.
 #
 #   python -m cluster_bench.sweep configs/matrix/gate_correctness.yaml
 #   python -m cluster_bench.report --reference ddp__full__t8192__s4096__gate
 
 defaults:
-  dataset: /opt/gpudata/medical-o1-reasoning-SFT
-  dataset_config: en
   seq_len: 4096
   micro_batch: 2
   packing: true
-  packing_strategy: bfd
   completion_only_loss: true
   warmup_steps: 0          # the loss curve starts at step 0
   measure_steps: 60

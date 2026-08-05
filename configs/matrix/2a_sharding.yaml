@@ -7,6 +7,10 @@
 # Budget: 9 cells, ~40 min.
 # Narrow start: --only ddp zero3__ zero3-hpz4 zero3-hpz2  (~20 min).
 
+# Data is the real corpus with `wrapped` packing (config.py defaults), so the
+# 8192 below is the literal token count, not a nominal one. report.py fails the
+# cell if the measured count drifts from it.
+
 defaults:
   seq_len: 4096
   micro_batch: 2          # 2 x 4096 = 8192 tok/GPU/step, the pinned control

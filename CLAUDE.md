@@ -90,6 +90,23 @@ Top 3 configs × {2048, 4096, 8192, 16384, 32768} tok/GPU/step (vary micro-batch
 fixed 4096 seq len). Finds where comm stops mattering. **Most durable output** — a
 portable cluster characteristic that transfers to un-benchmarked models.
 
+## Data: real corpus, `wrapped` packing (changed 2026-08-05)
+Timing runs use the real dataset, not synthetic. The control survives because
+`packing_strategy: wrapped` cuts the tokenized corpus into chunks of *exactly*
+`max_length`, so `micro_batch × seq_len` is the literal token count. **Never
+switch timing runs to `bfd`** — it emits sequences of at most `max_length` and
+tokens/step drifts between cells, which silently contaminates every overhead
+number. `metrics` counts the tokens that reach the model and `report.check_token_control`
+fails any cell drifting >1% from nominal.
+
+Packed sequences cross document boundaries and `sdpa` does not honour the
+boundary (no flash-attn in requirements). FLOPs are identical, so step times are
+unaffected and the gate still compares cells to each other; absolute loss is not
+a training loss. Recorded per run as `dataset.packed_attention_crosses_documents`.
+
+`--dataset synthetic` remains for node bring-up and for isolating a data-path
+problem from a comm problem.
+
 ## Config hygiene
 - **Pin** `reduce_bucket_size`, `stage3_prefetch_bucket_size`,
   `stage3_param_persistence_threshold` — currently `"auto"` in `ds_zero3.json`, and
@@ -144,10 +161,17 @@ of this has executed):
   of 2A needs the v1 `fsdp_sharding_strategy: HYBRID_SHARD` spelling instead.
 - **DeepSpeed AutoTP** (`tensor_parallel.autotp_size`) for row 9 — verify 0.19.2
   supports it for *training*, not just inference.
-- **TRL pretokenized path**: synthetic data passes `input_ids` +
-  `completion_mask` with `skip_prepare_dataset: True`. Confirm trl 1.8 honors
-  `completion_mask` on that path; if not, the synthetic set needs plain
-  `input_ids` and `completion_only_loss: false`.
+- **`wrapped` packing on a prompt-completion dataset**: confirm trl 1.8's
+  `pack_dataset(strategy="wrapped")` carries `completion_mask` through the
+  concat-and-chunk and yields chunks of exactly `max_length`. The first run's
+  `tokens_per_step_control_held` answers this directly — if it is false, the
+  whole real-data switch is invalid and `bfd` is not the fallback (see above);
+  the fallback is `--dataset synthetic`.
+- **TRL pretokenized path** (synthetic escape hatch only): passes `input_ids` +
+  pre-masked `labels` with `skip_prepare_dataset: True`.
+- **`_BenchSFTTrainer.training_step` signature**: subclassed in `train.py` to
+  count tokens; passes `*args/**kwargs` through, but confirm transformers 5.5
+  still calls it positionally as `(model, inputs, num_items_in_batch)`.
 - Proxy model still unverified: check Qwen3.5-4B is dense, not MoE.
   `modeling.check_dense` aborts the run if it isn't.
 - `flash-attn`, `wandb`, `openai` dropped from requirements (unused by the

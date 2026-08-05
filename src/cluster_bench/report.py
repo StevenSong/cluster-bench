@@ -83,6 +83,42 @@ def check_hpz_plausibility(runs: list[dict[str, Any]]) -> list[str]:
     return warnings
 
 
+def check_token_control(runs: list[dict[str, Any]]) -> list[str]:
+    """tokens/GPU/step is the control every comparison in this study rests on.
+
+    On real text it is a measured quantity, not a flag: `wrapped` packing is
+    supposed to deliver chunks of exactly seq_len, and if it does not, cells
+    are being compared at different token counts and every overhead number is
+    contaminated. Cheap to check, so it is checked.
+    """
+    warnings = []
+    for r in runs:
+        if r.get("tokens_per_step_control_held") is False:
+            warnings.append(
+                f"{r['run_id']}: measured "
+                f"{r.get('tokens_per_gpu_step_measured', 0):.0f} tokens/GPU/step "
+                f"against a nominal {r['tokens_per_gpu_step']} "
+                f"({r.get('tokens_per_step_drift', 0):.1%} drift). Packing did not "
+                "produce exact chunks -- this cell is not comparable to the rest."
+            )
+
+    measured = {
+        (r["placement"]["name"], r["tokens_per_gpu_step"], r["spec"]["seq_len"]): []
+        for r in runs
+    }
+    for r in runs:
+        if r.get("tokens_per_gpu_step_measured") is not None:
+            measured[_group_key(r)].append(r["tokens_per_gpu_step_measured"])
+    for key, vals in measured.items():
+        if len(vals) > 1 and min(vals) and max(vals) / min(vals) > 1.01:
+            warnings.append(
+                f"{key[0]}/t{key[1]}: cells in this comparison group saw different "
+                f"token counts ({min(vals):.0f}..{max(vals):.0f}); their step times "
+                "are not directly comparable."
+            )
+    return warnings
+
+
 def check_loss_curves(
     runs: list[dict[str, Any]], reference: str, tol: float
 ) -> list[str]:
@@ -181,6 +217,7 @@ def main() -> None:
 
     for label, notes in (
         ("provenance", provenance_spread(runs)),
+        ("token control", check_token_control(runs)),
         ("plausibility", check_hpz_plausibility(runs)),
         (
             "correctness gate",
@@ -205,6 +242,9 @@ def main() -> None:
                         "placement": r["placement"]["name"],
                         "links": r["placement"]["links"],
                         "tokens_per_gpu_step": r["tokens_per_gpu_step"],
+                        "tokens_per_gpu_step_measured": r.get(
+                            "tokens_per_gpu_step_measured"
+                        ),
                         "step_time_p50_s": r.get("step_time_p50_s"),
                         "step_time_p95_s": r.get("step_time_p95_s"),
                         "tokens_per_s_per_gpu": r.get("tokens_per_s_per_gpu"),
