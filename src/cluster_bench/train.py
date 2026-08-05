@@ -68,10 +68,15 @@ def run(spec: config.RunSpec) -> dict[str, Any]:
     )
 
     dataset_kwargs: dict[str, Any] = {"add_special_tokens": False}
+    # Samples are already exactly seq_len tokens; packing them again would
+    # reintroduce the variance the synthetic set exists to remove. TRL rejects
+    # padding_free without packing unless max_length is None ("already
+    # truncated inputs") -- which is exactly what the synthetic set is, so
+    # max_length has nothing left to enforce. tokens/GPU/step is unchanged.
+    max_length = spec.seq_len
     if is_synthetic:
-        # Samples are already exactly seq_len tokens; packing them again would
-        # reintroduce the variance the synthetic set exists to remove.
         dataset_kwargs = {"skip_prepare_dataset": True}
+        max_length = None
 
     total_steps = spec.warmup_steps + spec.measure_steps
 
@@ -89,7 +94,7 @@ def run(spec: config.RunSpec) -> dict[str, Any]:
         tf32=True,
         seed=spec.seed,
         data_seed=spec.seed,
-        max_length=spec.seq_len,
+        max_length=max_length,
         packing=spec.packing and not is_synthetic,
         packing_strategy=spec.packing_strategy,
         padding_free=spec.padding_free,
