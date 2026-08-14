@@ -171,10 +171,58 @@ than running them. DeepSpeed clamps `zero_hpz_partition_size` to the world size,
 so `hpz=4` on 2 GPUs runs as flat ZeRO-3 while still being labelled hpz4 — those
 cells are skipped with a printed reason.
 
+**Known bias in the headline metric: the DDP baseline runs cheaper optimizer
+arithmetic than the cells it is the baseline for.** `modeling.load` builds the
+model in bf16 and accelerate's `mixed_precision: bf16` does not upcast it, so
+the DDP and FSDP2 cells hold bf16 parameters, gradients and Adam moments and
+apply the update in place. DeepSpeed's bf16 path keeps an fp32 partitioned
+master copy of every parameter and applies the update in fp32. Two consequences:
+
+* An Adam step over 4B parameters moves ~32 GB of memory traffic in bf16 against
+  ~64–80 GB with fp32 masters — order 15 ms on a ~1 s step. `step_time_ddp` is
+  that much faster than a like-for-like baseline, so every `comm_overhead` is
+  biased **up** by a point or two. The bias is uniform; it does not reorder 2A.
+* Rows 7–8 (FSDP2) take the accelerate path and rows 4–6 (ZeRO-3) do not, so the
+  cross-check between them differs in optimizer precision as well as in
+  sharding. FSDP2 gets the cheaper optimizer step for free.
+
+No flag makes them match. Loading fp32 so DDP keeps master weights also makes
+its gradients fp32 and doubles its all-reduce volume, corrupting the denominator
+in the one dimension this study exists to measure. Pure-bf16 DDP has the right
+*wire* profile — bf16 gradients, the same as DeepSpeed's bf16 reduce — and only
+its optimizer step is cheap, so the bias is documented rather than removed.
+
+The symptom, if you ever need to identify this from a results JSON: a grad norm
+computed over bf16 gradients lands exactly on the bf16 grid (51.75, 39.75,
+27.125, 0.9921875), one computed in fp32 essentially never does.
+`report.check_precision_class_evidence` makes that check automatically and warns
+when a run's recorded norms contradict the backend it claims.
+
 Run the correctness gate before trusting any timing number. Every config must
 reproduce the reference loss curve at a fixed seed; this is what catches
 packing-mask and loss-normalization bugs, which otherwise present as a config
 that is impressively fast and quietly wrong.
+
+The gate only compares cells that can mean something to each other. Three
+exclusions, all reported rather than silently applied:
+
+| Skipped | Why |
+|---|---|
+| Different optimizer precision | The bf16/fp32-master split above separates the curves within two optimizer steps however correct both cells are |
+| Different `tp_size` | A TP group shares one batch, so sample order and `num_items_in_batch` both shift |
+| Different (placement, tokens) group | A different global batch is a legitimately different curve |
+
+So a full check needs one pass per family, and the reference has to come from
+inside the group being gated:
+
+```bash
+python -m cluster_bench.report --reference ddp__full__t8192__s4096__gate
+python -m cluster_bench.report --reference zero3__full__t8192__s4096__gate
+```
+
+Each pass ends with a line stating how many cells it actually compared. A gate
+that looks like it ran but checked nothing is the failure mode it exists to
+prevent.
 
 ## Layout
 

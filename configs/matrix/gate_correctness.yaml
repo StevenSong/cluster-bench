@@ -9,8 +9,14 @@
 # the gate exercises exactly the data path the timing matrices run. A gate on a
 # path nothing else uses proves nothing.
 #
+# One pass per numerical family: the DDP cell updates bf16 weights in place and
+# the DeepSpeed cells keep fp32 master weights, so their curves separate on
+# arithmetic alone and report.py reports the cross-family cells as not gated
+# rather than as failing. See "Reading the results" in README.md.
+#
 #   python -m cluster_bench.sweep configs/matrix/gate_correctness.yaml
 #   python -m cluster_bench.report --reference ddp__full__t8192__s4096__gate
+#   python -m cluster_bench.report --reference zero3__full__t8192__s4096__gate
 
 defaults:
   seq_len: 4096

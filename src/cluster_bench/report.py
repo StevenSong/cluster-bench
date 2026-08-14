@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import struct
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -20,6 +21,33 @@ from typing import Any, Iterable
 # something is wrong -- usually a cell that silently degraded to a different
 # config, or a token count that isn't actually matched.
 HPZ_MAX_PLAUSIBLE_RECOVERY = 2 / 3
+
+# Backends whose optimizer keeps fp32 master weights. DeepSpeed's bf16 path
+# holds an fp32 partitioned copy of every parameter and applies the Adam update
+# in fp32. The accelerate path (DDP, FSDP2) does not: modeling.load builds the
+# model in bf16 and `mixed_precision: bf16` does not upcast it, so parameters,
+# gradients and Adam moments are all bf16 and the update is applied in place.
+#
+# At lr=6e-6 an update is a fraction of a bf16 ulp for a typical weight, so the
+# two paths train at measurably different rates -- the bf16 cells reach a higher
+# loss at the same step. That is a property of the numerics, not of the sharding
+# the cell exists to measure, so cells on different sides of this line cannot be
+# gated against each other. See check_loss_curves.
+_FP32_MASTER_BACKENDS = {"deepspeed"}
+
+
+def _precision_class(r: dict[str, Any]) -> str:
+    backend = r.get("strategy", {}).get("backend", "unknown")
+    return "fp32-master" if backend in _FP32_MASTER_BACKENDS else "bf16-in-place"
+
+
+def _is_bf16_exact(x: float) -> bool:
+    """True if x lands exactly on the bfloat16 grid (low 16 bits of fp32 zero).
+
+    A bf16 value is exact in fp32 and in a JSON double, so the round-trip is
+    lossless and this is a decision rather than a tolerance.
+    """
+    return struct.unpack("<I", struct.pack("<f", x))[0] & 0xFFFF == 0
 
 
 def load(runs_dir: Path) -> list[dict[str, Any]]:
@@ -132,10 +160,19 @@ def check_loss_curves(
         return [f"reference run {reference!r} has no loss curve"]
 
     ref_tp = ref["strategy"].get("tp_size", 1)
+    ref_precision = _precision_class(ref)
 
     problems = []
+    gated = 0
     for r in runs:
         if r["run_id"] == reference:
+            continue
+        # A 2-GPU placement or a different tokens/GPU/step is a different global
+        # batch, so the curve is legitimately different and nothing about the
+        # difference is a correctness signal. Silent here rather than a note:
+        # pointed at results/runs this is most of the matrix, and thirty lines
+        # saying "2B and 2C exist" would bury the cells that were checked.
+        if _group_key(r) != _group_key(ref):
             continue
         # A TP cell cannot be gated against a non-TP reference, and not because
         # anything is wrong with it: its TP group is fed one batch, so the
@@ -151,18 +188,86 @@ def check_loss_curves(
                 "use a TP run as --reference to gate this row."
             )
             continue
+        # Same reasoning, different mechanism: an fp32-master cell and a
+        # bf16-in-place cell are running different optimizer arithmetic, so
+        # their curves separate within a couple of steps no matter how correct
+        # both are. Gating one against the other reports a numerics difference
+        # as a sharding bug. Use a reference from the same family.
+        if _precision_class(r) != ref_precision:
+            problems.append(
+                f"{r['run_id']}: not gated -- {_precision_class(r)} optimizer "
+                f"(backend {r['strategy']['backend']}) vs reference's "
+                f"{ref_precision} (backend {ref['strategy']['backend']}). The "
+                "two apply the update in different precision, so the curves "
+                "separate on numerics alone. Gate this cell against a reference "
+                "from the same family."
+            )
+            continue
         curve = {p["step"]: p["loss"] for p in r.get("loss_curve", [])}
         shared = sorted(set(curve) & set(ref_curve))
         if not shared:
             problems.append(f"{r['run_id']}: no overlapping logged steps with reference")
             continue
+        gated += 1
         worst = max(abs(curve[s] - ref_curve[s]) for s in shared)
         if worst > tol:
             problems.append(
                 f"{r['run_id']}: max loss deviation {worst:.4f} over {len(shared)} "
                 f"steps exceeds tol {tol}"
             )
+
+    # The failure this whole gate exists to prevent is a gate that looks like it
+    # ran. Say how many cells it actually compared, so "no problems" cannot mean
+    # "nothing was checked".
+    in_group = sum(
+        1
+        for r in runs
+        if r["run_id"] != reference and _group_key(r) == _group_key(ref)
+    )
+    problems.append(
+        f"gated {gated} of {in_group} cells in {reference}'s "
+        f"{_group_key(ref)[0]}/t{_group_key(ref)[1]} group "
+        f"({ref_precision}, tp={ref_tp}) at tol {tol}"
+    )
     return problems
+
+
+def check_precision_class_evidence(runs: list[dict[str, Any]]) -> list[str]:
+    """Cross-check the declared optimizer precision against the recorded norms.
+
+    _precision_class reads the backend, which is a claim about how the run was
+    configured. The grad norms are evidence: a norm computed over bf16 gradients
+    lands exactly on the bf16 grid, one computed in fp32 essentially never does.
+    If the two disagree, the backend map is stale -- a precision flag changed, or
+    a new backend was added -- and the gate is silently mis-grouping cells.
+
+    Only the unambiguous direction is flagged. An fp32-master run whose every
+    norm is bf16-exact cannot be a coincidence, but a bf16-in-place run with
+    non-exact norms is expected in at least one case: FSDP2's mixed-precision
+    policy can reduce gradients in fp32 while parameters stay bf16, which is a
+    real configuration and not a contradiction.
+    """
+    notes = []
+    for r in runs:
+        norms = [
+            p["grad_norm"]
+            for p in r.get("loss_curve", [])
+            if isinstance(p.get("grad_norm"), (int, float)) and p["grad_norm"]
+        ]
+        if len(norms) < 5:
+            continue
+        if _precision_class(r) == "fp32-master" and all(
+            _is_bf16_exact(v) for v in norms
+        ):
+            notes.append(
+                f"{r['run_id']}: declared fp32-master (backend "
+                f"{r['strategy']['backend']}) but all {len(norms)} recorded grad "
+                "norms are exactly bf16-representable, which means the optimizer "
+                "is not keeping fp32 master weights. report._FP32_MASTER_BACKENDS "
+                "no longer describes this run, and the correctness gate is "
+                "grouping cells by the wrong families."
+            )
+    return notes
 
 
 def _fmt(v: Any, spec: str, dash: str = "-") -> str:
@@ -229,7 +334,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--runs-dir", type=Path, default=Path("results/runs"))
     ap.add_argument("--reference", default=None,
-                    help="run_id whose loss curve is the correctness gate")
+                    help="run_id whose loss curve is the correctness gate. Only "
+                         "cells with the same optimizer precision and tp_size "
+                         "are gated against it; the rest are reported as not "
+                         "gated, so a full sweep needs one pass per family")
     ap.add_argument("--loss-tol", type=float, default=0.02)
     ap.add_argument("--json-out", type=Path, default=None)
     args = ap.parse_args()
@@ -245,6 +353,7 @@ def main() -> None:
         ("provenance", provenance_spread(runs)),
         ("token control", check_token_control(runs)),
         ("plausibility", check_hpz_plausibility(runs)),
+        ("optimizer precision", check_precision_class_evidence(runs)),
         (
             "correctness gate",
             check_loss_curves(runs, args.reference, args.loss_tol)
