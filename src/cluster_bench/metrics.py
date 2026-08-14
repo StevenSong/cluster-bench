@@ -120,11 +120,30 @@ class BenchCallback(TrainerCallback):
             control.should_training_stop = True
         return control
 
+    # Logged alongside the loss because the loss curve alone cannot say *why*
+    # two cells diverge. grad_norm is the pre-clip global norm on both paths --
+    # accelerator.clip_grad_norm_ returns it for DDP/FSDP, DeepSpeed's
+    # get_global_grad_norm() for the ZeRO cells -- so the two are directly
+    # comparable, and a constant factor between backends is a gradient-scaling
+    # difference that max_grad_norm then turns into a real trajectory split.
+    # learning_rate is here to make "both cells were actually at the same LR"
+    # checkable rather than assumed.
+    _LOG_EXTRAS = ("grad_norm", "learning_rate")
+
     def on_log(self, args, state, control, logs=None, **kw):  # noqa: ANN001
         if logs and "loss" in logs:
-            self.loss_curve.append(
-                {"step": float(state.global_step), "loss": float(logs["loss"])}
-            )
+            point = {"step": float(state.global_step), "loss": float(logs["loss"])}
+            for k in self._LOG_EXTRAS:
+                v = logs.get(k)
+                # HF omits grad_norm on steps where it has none, and can log it
+                # as a tensor; neither should cost a run its curve.
+                if v is None:
+                    continue
+                try:
+                    point[k] = float(v)
+                except (TypeError, ValueError):
+                    pass
+            self.loss_curve.append(point)
 
     # -- results -------------------------------------------------------
     def summary(self, world_size: int) -> dict[str, Any]:
