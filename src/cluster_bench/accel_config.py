@@ -68,7 +68,28 @@ def build(
             "fsdp_auto_wrap_policy": "TRANSFORMER_BASED_WRAP",
             "fsdp_state_dict_type": "SHARDED_STATE_DICT",
             "fsdp_offload_params": False,
-            "fsdp_cpu_ram_efficient_loading": True,
+            # False, deliberately. It would buy nothing here and it hangs.
+            #
+            # Nothing: transformers' is_fsdp_enabled() -- the gate that makes
+            # ranks != 0 skip loading real weights -- requires
+            # torch.distributed.is_initialized(), and train.py loads the model
+            # before SFTConfig touches args.device and brings the process group
+            # up. The gate is False at from_pretrained() time, so every rank
+            # loads full weights regardless of what this says.
+            #
+            # Hangs: with it on, accelerate still takes the
+            # fsdp2_load_full_state_dict path at prepare time, which pairs rank
+            # 0's *pre-shard* state dict positionally against the *post-shard*
+            # sharded one and does a broadcast + a distribute_tensor per
+            # parameter. Any key-sequence difference between the two (tied
+            # lm_head, non-persistent buffers, liger-swapped modules) misaligns
+            # the pairing; NCCL does not size-check broadcasts, so rank 0 blocks
+            # on a collective its peers never post while they queue 2x398 works
+            # behind it, and the run dies on a watchdog timeout at init.
+            #
+            # Off, every rank shards the weights it already holds -- same host
+            # RAM as today (~8 GB/rank at 4B), no rank-0 broadcast loop at all.
+            "fsdp_cpu_ram_efficient_loading": False,
             "fsdp_activation_checkpointing": False,  # HF trainer owns this
         }
         if strategy.fsdp_hybrid:
