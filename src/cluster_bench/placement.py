@@ -96,6 +96,40 @@ def get(name: str) -> Placement:
         ) from None
 
 
+def _pair_adjacency_reasons(placement: Placement, what: str) -> list[str]:
+    """Reasons consecutive rank pairs are not NVLinked under this placement.
+
+    Both hpZ=2 and autotp=2 group *adjacent global ranks*: DeepSpeed builds the
+    TP mesh as (data_parallel, tensor_parallel) with tensor_parallel innermost,
+    so the TP group is ranks (0,1), (2,3), ... exactly like an hpZ=2 gather
+    group. Either one only rides NVLink if those adjacent ranks are a cabled
+    pair, and neither says anything when they are not -- the run just gets
+    slower. Checked against the launch order each node actually gets, not
+    node0's spelling of it, because the peer's reversal can move where the
+    chunk boundaries fall.
+    """
+    reasons: list[str] = []
+    if placement.procs_per_machine % 2:
+        # An odd process count makes a group straddle two machines, which is a
+        # different thing entirely from the pair-local config being requested.
+        reasons.append(
+            f"{what} needs an even procs_per_machine to stay inside a node; "
+            f"placement {placement.name} has {placement.procs_per_machine}"
+        )
+        return reasons
+    for rank in range(placement.num_machines):
+        rank_devs = placement.devices_for(rank)
+        for lo in range(0, len(rank_devs), 2):
+            chunk = tuple(rank_devs[lo : lo + 2])
+            if len(chunk) == 2 and frozenset(chunk) not in _PAIR_SETS:
+                reasons.append(
+                    f"{what} assumes adjacent ranks are NVLinked, but placement "
+                    f"{placement.name} puts devices {chunk} together on "
+                    f"machine_rank {rank}"
+                )
+    return reasons
+
+
 def validate(strategy: Strategy, placement: Placement) -> list[str]:
     """Return reasons this (strategy, placement) cell is not measurable.
 
@@ -126,6 +160,11 @@ def validate(strategy: Strategy, placement: Placement) -> list[str]:
         )
     if strategy.autotp and ws % strategy.autotp:
         reasons.append(f"autotp={strategy.autotp} does not divide world_size {ws}")
+    if strategy.autotp and strategy.autotp == ws:
+        reasons.append(
+            f"autotp={strategy.autotp} equals world_size {ws}: no data-parallel "
+            "dimension is left, so ZeRO has nothing to shard over"
+        )
 
     # hpZ=4 is "node-local" only if a gather group is exactly one node's GPUs.
     if strategy.hpz == 4 and placement.procs_per_machine != 4:
@@ -133,18 +172,11 @@ def validate(strategy: Strategy, placement: Placement) -> list[str]:
             f"hpz=4 is only node-local when procs_per_machine == 4; placement "
             f"{placement.name} has {placement.procs_per_machine}"
         )
-    # hpZ=2 is "pair-local" only if consecutive rank pairs are NVLinked. Check
-    # the launch order each node actually gets, not node0's spelling of it --
-    # the peer's reversal can move where the chunk boundaries fall.
+    # hpZ=2 is "pair-local" only if consecutive rank pairs are NVLinked, and
+    # TP=2 is "in-pair" under exactly the same condition -- same grouping rule,
+    # same silent degradation when it does not hold.
     if strategy.hpz == 2:
-        for rank in range(placement.num_machines):
-            rank_devs = placement.devices_for(rank)
-            for lo in range(0, len(rank_devs), 2):
-                chunk = tuple(rank_devs[lo : lo + 2])
-                if len(chunk) == 2 and frozenset(chunk) not in _PAIR_SETS:
-                    reasons.append(
-                        f"hpz=2 assumes adjacent ranks are NVLinked, but "
-                        f"placement {placement.name} puts devices {chunk} "
-                        f"together on machine_rank {rank}"
-                    )
+        reasons += _pair_adjacency_reasons(placement, "hpz=2")
+    if strategy.autotp == 2:
+        reasons += _pair_adjacency_reasons(placement, "autotp=2")
     return reasons

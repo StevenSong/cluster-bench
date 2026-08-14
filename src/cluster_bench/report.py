@@ -131,9 +131,25 @@ def check_loss_curves(
     if not ref_curve:
         return [f"reference run {reference!r} has no loss curve"]
 
+    ref_tp = ref["strategy"].get("tp_size", 1)
+
     problems = []
     for r in runs:
         if r["run_id"] == reference:
+            continue
+        # A TP cell cannot be gated against a non-TP reference, and not because
+        # anything is wrong with it: its TP group is fed one batch, so the
+        # sampler walks the corpus in a different order, and HF's
+        # num_items_in_batch counts the duplicated batch, which rescales the
+        # logged loss. Both shift the curve without saying anything about
+        # correctness. Gate a TP cell against another TP cell.
+        if r["strategy"].get("tp_size", 1) != ref_tp:
+            problems.append(
+                f"{r['run_id']}: not gated -- tp_size "
+                f"{r['strategy'].get('tp_size', 1)} vs reference's {ref_tp}. "
+                "Sample order and loss normalization both differ under TP; "
+                "use a TP run as --reference to gate this row."
+            )
             continue
         curve = {p["step"]: p["loss"] for p in r.get("loss_curve", [])}
         shared = sorted(set(curve) & set(ref_curve))

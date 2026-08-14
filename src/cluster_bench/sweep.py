@@ -362,11 +362,11 @@ def run_cell(cell: Cell, args: argparse.Namespace) -> dict[str, Any]:
 def _matches(cell: Cell, keys: list[str]) -> bool:
     """Select cells by strategy or placement name, matched exactly.
 
-    Plain substring matching on run_id is too loose to be safe: `zero3` is a
-    substring of `tp2-zero3`, so the documented narrow-start invocation would
-    quietly pull in a TP cell and turn a 4-cell run into 5. Strategy and
-    placement names therefore match exactly; anything else falls back to
-    substring so tags and token counts stay selectable.
+    Plain substring matching on run_id is too loose to be safe: `zero2` is a
+    substring of `tp2-zero2`, so asking for the ZeRO-2 row would quietly pull in
+    the TP cell as well. Strategy and placement names therefore match exactly;
+    anything else falls back to substring so tags and token counts stay
+    selectable.
     """
     known = set(strategies_mod.STRATEGIES) | set(placement_mod.PLACEMENTS)
     for k in keys:

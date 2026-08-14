@@ -51,6 +51,16 @@ class Strategy:
     def uses_deepspeed(self) -> bool:
         return self.backend == "deepspeed"
 
+    @property
+    def tp_size(self) -> int:
+        """Ranks that are fed the same micro-batch. 1 when TP is off.
+
+        Everything downstream that reasons about *tokens* has to divide by this:
+        a TP group holds one copy of the batch between its ranks, so a per-rank
+        token tally counts every token tp_size times.
+        """
+        return self.autotp or 1
+
 
 # Matrix 2A. Rows 1->2->3->4 decompose ZeRO's cost: optimizer, then grads, then
 # params. Rows 5/6 vary *only* the param-gather scope against row 4.
@@ -138,19 +148,34 @@ STRATEGIES: dict[str, Strategy] = {
         min_world_size=8,
         world_size_multiple_of=4,
     ),
-    "tp2-zero3": Strategy(
-        name="tp2-zero3",
+    "tp2-zero2": Strategy(
+        name="tp2-zero2",
         backend="deepspeed",
-        zero_stage=3,
+        zero_stage=2,
         autotp=2,
         purpose="only sane TP degree on a 2-GPU NVLink domain",
-        param_gather="pair",
+        param_gather="none",
         grad_reduce="global",
         min_world_size=4,
         world_size_multiple_of=2,
         notes=(
+            "Stage 2, not 3: deepspeed 0.19.2 asserts "
+            "`zero_optimization_stage() <= 2` when autotp is on "
+            "(runtime/engine.py). v0.19.4 lifted it, but taking that upgrade "
+            "would change the runtime under every other cell of 2A.",
+            "TP keeps parameters permanently sharded inside the pair, so there "
+            "is no param all-gather for stage 3 to have optimized -- which is "
+            "why the ZeRO-2 substitution costs this row nothing it was going "
+            "to measure. Its single-variable baseline is row 3 (plain zero2).",
+            "param_gather='none' is honest but incomplete: the comm this row "
+            "adds is a per-layer activation all-reduce inside the NVLink pair, "
+            "which the Scope fields cannot express. Grad reduce is over the DP "
+            "group of world/2, so it still crosses PCIe and RoCE.",
             "TP all-reduces are synchronous and unhideable, unlike ZeRO's "
             "overlappable gathers. Expect a different shape of overhead curve.",
+            "Both ranks of a TP group consume the *same* micro-batch, so "
+            "train.py doubles the per-device batch to hold 8192 tok/GPU/step "
+            "of compute, and metrics divides the token tally by tp_size.",
         ),
     ),
 }

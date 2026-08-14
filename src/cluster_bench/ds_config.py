@@ -62,8 +62,24 @@ def build(spec: RunSpec, strategy: Strategy) -> dict[str, Any]:
     }
 
     if strategy.autotp:
-        # DeepSpeed AutoTP for training. TP shards inside the NVLink domain;
-        # ZeRO-3 then shards across the remaining (cross-pair) dimension.
+        if strategy.zero_stage >= 3:
+            # deepspeed 0.19.2, runtime/engine.py::_configure_tensor_parallel_states:
+            #     assert self.zero_optimization_stage() <= 2, "Currently, the
+            #     compatibility between 'autotp' and 'zero_stage = 3' has not
+            #     been validated"
+            # It fires at engine init on every rank, so the cell dies ~2 minutes
+            # in with a stack trace instead of a config error. Caught here, on
+            # node0, before anything is launched. v0.19.4 removed the assert;
+            # taking that upgrade means re-running all of 2A on the new runtime.
+            raise ValueError(
+                f"{strategy.name}: autotp is incompatible with zero stage "
+                f"{strategy.zero_stage} on deepspeed 0.19.2 (max stage 2). "
+                "Use stage <= 2, or upgrade to >= 0.19.4 and re-run the whole "
+                "matrix so every cell shares a runtime."
+            )
+        # DeepSpeed AutoTP for training. TP shards each layer inside the NVLink
+        # pair; ZeRO-2 then shards grads + optimizer state across the remaining
+        # (cross-pair) dimension, a DP group of world_size / autotp.
         cfg["tensor_parallel"] = {"autotp_size": strategy.autotp}
 
     return cfg

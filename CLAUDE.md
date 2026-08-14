@@ -76,9 +76,17 @@ Report all overheads against this, not against spec FLOPS.
 | 6 | ZeRO-3 hpZ=2 | pair-local (NVLink) | global | no PCIe/RoCE gathers |
 | 7 | FSDP2 FULL_SHARD | global | global | cross-check vs #4 |
 | 8 | FSDP2 HYBRID_SHARD | node-local | global | cross-check vs #5 |
-| 9 | TP=2 × ZeRO-3(4) | in-pair | global | only sane TP degree here |
+| 9 | TP=2 × ZeRO-2(4) | in-pair (TP, not ZeRO) | global | only sane TP degree here |
 
 Rows 1→2→3→4 decompose ZeRO's cost: optimizer, then grads, then params.
+
+**Row 9 is ZeRO-2, not ZeRO-3** (changed 2026-08-14): deepspeed 0.19.2 asserts
+`zero_optimization_stage() <= 2` whenever autotp is on. It costs the row nothing —
+TP keeps params permanently sharded in-pair, so stage 3 had no param all-gather left
+to optimize; its comm is a per-layer *activation* all-reduce on NVLink plus a grad
+reduce over the DP group of 4, which still crosses PCIe and RoCE. Read it against
+row 3 (plain ZeRO-2): single variable, TP added. v0.19.4 (2026-08-06) removed the
+assert, but taking that upgrade means re-running all of 2A on a new runtime.
 
 **Interpretive guard:** hpZ optimizes *only* the param all-gather. Grad reduce-scatter
 stays global (crosses RoCE) in every config. Gathers ≈ 14 of ~21 GB/step, so **hpZ's
@@ -181,8 +189,29 @@ of this has executed):
 - **FSDP2 hybrid**: `accel_config.py` emits `fsdp_shard_size` for the 2-D mesh.
   Confirm accelerate 1.14 honors that key for `fsdp_version: 2`; if not, rows 8
   of 2A needs the v1 `fsdp_sharding_strategy: HYBRID_SHARD` spelling instead.
-- **DeepSpeed AutoTP** (`tensor_parallel.autotp_size`) for row 9 — verify 0.19.2
-  supports it for *training*, not just inference.
+- ~~**DeepSpeed AutoTP** for row 9 — verify 0.19.2 supports it for training~~ —
+  ANSWERED on-cluster 2026-08-14: 0.19.2 supports autotp for training at ZeRO
+  stage ≤ 2 only, asserting on stage 3. Row 9 is now `tp2-zero2`; `ds_config`
+  refuses autotp+stage3 on node0 rather than letting every rank assert. Three
+  consequences of TP that are now handled in code and are worth remembering,
+  because none of them announces itself:
+  - **The HF sampler is not TP-aware.** It shards across all 8 ranks, so the two
+    ranks of a TP group get different data and DeepSpeed's one-shot
+    "Data inconsistency within the TP group" hook fires on the first forward.
+    `train._TPBatchBroadcaster` broadcasts the source rank's batch over the TP
+    group (in `_prepare_inputs`, after the batch is on the GPU).
+  - **The token control needs scaling on both sides.** A TP group shares one
+    batch, so the per-device batch is doubled (`device_micro_batch`) to keep
+    8192 tok/GPU/step of compute and the same global batch as DDP, and
+    `metrics` divides the per-rank tally by `tp_size` so the cell still groups
+    with its DDP baseline. `spec.tokens_per_gpu_step` stays 8192.
+  - **The loss gate does not apply to it.** Different sample order and a
+    duplicated-batch `num_items_in_batch` both shift the curve; `report`
+    reports the row as not gated rather than as failing.
+  - Still unverified on hardware: whether HF/DeepSpeed's train_batch_size
+    bookkeeping (HF computes it from the full world, DeepSpeed's dp_world_size
+    is world/2) is consistent, and whether AutoTP's module coverage on Qwen3
+    leaves anything unsharded.
 - **`wrapped` packing on a prompt-completion dataset**: confirm trl 1.8's
   `pack_dataset(strategy="wrapped")` carries `completion_mask` through the
   concat-and-chunk and yields chunks of exactly `max_length`. The first run's
@@ -191,9 +220,10 @@ of this has executed):
   the fallback is `--dataset synthetic`.
 - **TRL pretokenized path** (synthetic escape hatch only): passes `input_ids` +
   pre-masked `labels` with `skip_prepare_dataset: True`.
-- **`_BenchSFTTrainer.training_step` signature**: subclassed in `train.py` to
-  count tokens; passes `*args/**kwargs` through, but confirm transformers 5.5
-  still calls it positionally as `(model, inputs, num_items_in_batch)`.
+- **`_BenchSFTTrainer._prepare_inputs` hook**: token counting moved off
+  `training_step` (2026-08-14) so the TP broadcast can run on GPU tensors and
+  the count can follow it. Confirm trl 1.8's SFTTrainer does not override
+  `_prepare_inputs` in a way that skips the super() call.
 - **Qwen3-4B must be staged at `/opt/gpudata/models/Qwen/Qwen3-4B` on both nodes** —
   the new default path, not yet confirmed present. `modeling.check_dense` and
   `modeling.check_full_attention` abort the run if the model at that path is MoE or

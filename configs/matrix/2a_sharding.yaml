@@ -29,4 +29,8 @@ strategies:
   - zero3-hpz2            # pair-local (NVLink) gather
   - fsdp-full             # cross-check vs zero3
   - fsdp-hybrid           # cross-check vs zero3-hpz4
-  - tp2-zero3
+  # TP inside the NVLink pair. ZeRO-2 rather than the planned ZeRO-3 because
+  # deepspeed 0.19.2 asserts autotp is incompatible with stage 3; TP already
+  # keeps params sharded in-pair, so stage 3 had no param gather left to
+  # optimize here. Reads against zero2 above as a single-variable comparison.
+  - tp2-zero2

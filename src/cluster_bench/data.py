@@ -80,16 +80,27 @@ def _mean_tokens_per_example(spec: RunSpec, ds: Dataset, tokenizer) -> float:
     return max(1.0, (total / n) * _TEMPLATE_OVERHEAD)
 
 
-def _n_examples_needed(spec: RunSpec, ds: Dataset, tokenizer, world_size: int) -> int:
+def _n_examples_needed(
+    spec: RunSpec,
+    ds: Dataset,
+    tokenizer,
+    world_size: int,
+    device_micro_batch: int,
+) -> int:
     """How much of the split a cell has to touch.
 
     A 40-second cell has no business tokenizing a 25k-example corpus nine times
     over -- dataset preparation would dominate the thing being measured. Sizing
     is by tokens when packing (the corpus is one stream, sliced into chunks) and
     by examples when it is off (one example per sequence).
+
+    Sized on `device_micro_batch`, the batch the trainer is actually handed --
+    under TP that is spec.micro_batch * tp_size, and every rank still pulls one
+    (the duplicates are thrown away by the TP broadcast). Sizing on
+    spec.micro_batch there would starve the loader mid-measurement.
     """
     steps = spec.warmup_steps + spec.measure_steps
-    sequences = steps * spec.micro_batch * spec.grad_accum * world_size
+    sequences = steps * device_micro_batch * spec.grad_accum * world_size
 
     if not spec.packing:
         needed = sequences
@@ -100,10 +111,14 @@ def _n_examples_needed(spec: RunSpec, ds: Dataset, tokenizer, world_size: int) -
     return min(len(ds), int(needed * _SIZING_MARGIN) + world_size)
 
 
-def _real(spec: RunSpec, tokenizer, world_size: int) -> Dataset:
+def _real(
+    spec: RunSpec, tokenizer, world_size: int, device_micro_batch: int
+) -> Dataset:
     ds = load_dataset(spec.dataset, spec.dataset_config, split=spec.dataset_split)
 
-    n = spec.dataset_num_samples or _n_examples_needed(spec, ds, tokenizer, world_size)
+    n = spec.dataset_num_samples or _n_examples_needed(
+        spec, ds, tokenizer, world_size, device_micro_batch
+    )
     # Head of the split rather than a shuffled sample: deterministic without
     # depending on datasets' shuffle implementation, and every cell in the
     # matrix therefore sees byte-identical text in identical order.
@@ -131,16 +146,26 @@ def _real(spec: RunSpec, tokenizer, world_size: int) -> Dataset:
 
 
 def build(
-    spec: RunSpec, tokenizer, vocab_size: int, world_size: int
+    spec: RunSpec,
+    tokenizer,
+    vocab_size: int,
+    world_size: int,
+    device_micro_batch: int | None = None,
 ) -> tuple[Dataset, bool]:
     """Return (dataset, is_synthetic).
 
     Sized so a run has enough samples for warmup + measurement with margin,
     and never so many that dataset construction dominates a 40-second cell.
+
+    `device_micro_batch` defaults to spec.micro_batch and differs from it only
+    under tensor parallelism -- see _n_examples_needed.
     """
+    if device_micro_batch is None:
+        device_micro_batch = spec.micro_batch
+
     if spec.dataset != "synthetic":
-        return _real(spec, tokenizer, world_size), False
+        return _real(spec, tokenizer, world_size, device_micro_batch), False
 
     steps = spec.warmup_steps + spec.measure_steps
-    needed = steps * spec.micro_batch * spec.grad_accum * world_size
+    needed = steps * device_micro_batch * spec.grad_accum * world_size
     return _synthetic(spec, vocab_size, int(needed * 1.25) + world_size), True
