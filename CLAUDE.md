@@ -62,12 +62,37 @@ zero1 0.198, tp2-zero2 0.367, hpz2 0.437, zero3 0.456, hpz4 0.466.
    range, so those points measure fixed cost against fixed cost.
 5. **TP=2 costs ~0.17 s/step** even entirely on NVLink (0.367 against zero2's
    0.196), as predicted: TP all-reduces are synchronous and unhideable.
-6. **Unexplained: the 2-GPU same-node ZeRO-3 cells.** Exposed comm normalised
-   by the (N−1)/N gather factor is 0.48–0.52 everywhere except across-pairs
-   (0.71) and within-pair (0.86) — the fastest link, worst per byte. Not noise,
-   not memory pressure. `configs/matrix/2b_anomaly_profile.yaml` probes it.
-   Until it is explained, placement conclusions rest on the DDP rows and the
-   4-GPU pair.
+6. **The 2-GPU same-node ZeRO-3 cells are not a fabric effect.** Exposed comm
+   normalised by the (N−1)/N gather factor is 0.48–0.52 everywhere except
+   across-pairs (0.71) and within-pair (0.86) — the fastest link, worst per
+   byte. Profiled 2026-08-15 (`2b_anomaly_profile.yaml`): **every DeepSpeed
+   timer is placement-flat within 2.7%, and within-pair is fastest in all of
+   them.** `bwd_allreduce` is 5–16 ms, ~1% of the step. The entire difference
+   is untimed remainder — 251 / 190 / 92 ms — in the region between DeepSpeed's
+   timers and the step boundary: `_prepare_inputs`, HF's `num_items_in_batch`
+   all-reduce, and the end-of-step `cuda.synchronize()` that drains whatever
+   `overlap_comm` left in flight. DeepSpeed's timers bound the CPU-side enqueue
+   window only, so they cannot separate late-completing comm from host work.
+   **Closed as not worth chasing, 2026-08-15.** No conclusion depends on it:
+   result 3 rests on the DDP rows (which show no anomaly) and the 4-GPU pair
+   (also clean), 2-GPU placements are diagnostic-only, and full/8192 normalizes
+   to 0.52 in line with the consistent cells. Do not cite the 2-GPU ZeRO-3 rows
+   as evidence for anything. Suggestive but unpursued: the two elevated cells
+   are the two that co-locate ranks on one node.
+
+7. **The instrument, not the cluster — and this one does matter.** The profile
+   above showed DeepSpeed accounts for only 82–93% of the step, with exposed
+   comm in the untimed remainder. `sync_each_step` is justified in config.py as
+   "applied identically to every config", but identical application is not
+   equal effect: ZeRO-3 has far more async comm in flight at a step boundary
+   than DDP, so the barrier exposes more of it, and in real training some of
+   that would overlap into the next step. The bias therefore differs per
+   backend and does **not** cancel in `comm_overhead`. Untested. One 15-minute
+   run bounds it — `2a_sharding.yaml --only ddp zero3 fsdp-full
+   --no-sync-each-step` at full/8192. If ZeRO-3's exposed comm falls further
+   than FSDP2's, part of the 3× backend gap in result 1 is the harness, which
+   would be the largest available correction to this study and lands directly
+   on the 0.30 s the 31B confirm is built around.
 
 **Correction to the proxy argument.** "P cancels" holds for the bytes, but
 comm/compute = 6·A/(8·T·B) and *achieved* FLOP/s A does not cancel. The DDP

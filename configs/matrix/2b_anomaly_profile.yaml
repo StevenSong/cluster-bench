@@ -17,16 +17,76 @@
 # Until this is explained, the placement conclusions rest on the DDP rows and
 # the 4-GPU pair. DDP shows none of it: within-pair is its fastest cell.
 #
-# Two candidates, and the two things this matrix collects tell them apart:
+# RESULT, 2026-08-15: all three candidates below are dead, and the answer is
+# that none of DeepSpeed's timers can see the effect at all.
 #
-#   1. DeepSpeed's stage-3 runtime, not the wire. `wall_clock_breakdown: true`
-#      splits the step into its comm and optimizer phases; if the extra time is
-#      in the parameter-fetch/reduce accounting rather than in a longer
-#      collective, this is the same finding as fsdp-full beating zero3 by 3x,
-#      showing up again at 2 ranks.
-#   2. NCCL picking a different algorithm or protocol at world size 2 on an
-#      intra-node NVLink pair than it picks for the same 2 ranks over RoCE.
-#      That choice is made at init and printed by NCCL_DEBUG_SUBSYS=INIT,TUNING.
+#   cell            fwd+bwd_inner  bwd_allreduce  step   DS total  measured  untimed
+#   within-pair          1033.3          5.31     97.1    1136.0    1387.0    251.0
+#   across-pairs         1052.4         16.36     98.0    1166.9    1356.9    189.9
+#   across-nodes         1045.4         10.20     97.2    1153.0    1245.3     92.3
+#
+# Every timed phase is placement-flat (2.7% spread), and within-pair is the
+# *fastest* cell in every one of them -- fwd -5.0 ms against across-nodes,
+# bwd_inner -7.1, bwd_allreduce -4.9. Wherever DeepSpeed can see the fabric the
+# link hierarchy is correct. The gradient reduce-scatter is 5-16 ms, ~1% of the
+# step, so it was never a candidate for a 140 ms effect, and the param gathers
+# are fully hidden behind ~1.04 s of compute in all three placements -- which is
+# why the naive bandwidth argument (RoCE should be ~140 ms *slower* here) never
+# appears in the numbers.
+#
+# The whole anomaly is the untimed remainder: 251 vs 92 ms, which reproduces the
+# ranking on its own. metrics.py measures on_step_begin -> on_step_end with a
+# cuda sync at each end, and HF fires on_step_begin after the dataloader has
+# yielded, so that region is: _prepare_inputs (H2D + token tally), HF's
+# num_items_in_batch all-reduce and its implicit sync, trainer bookkeeping, and
+# the end-of-step synchronize -- which drains every async collective
+# `overlap_comm: true` issued and DeepSpeed never waited on. DeepSpeed's timers
+# bound the CPU-side enqueue window; GPU-side completion of overlapped comm
+# lands outside all of them. So this output cannot separate "comm" from "not
+# comm", and the next two runs are what do:
+#
+#   --no-sync-each-step   gap collapses => GPU-side drain of async comm.
+#                         gap survives  => host-side.
+#   --dataset synthetic   gap collapses => the data path. Follow with
+#                         --dataloader-num-workers 2.
+#
+# Suggestive but not established: the two elevated cells are exactly the two
+# that put 2 ranks on one node, and the clean one is the one that does not.
+# That does not explain within-pair being worse than across-pairs.
+#
+# The original three candidates, all excluded by the table above:
+#
+#   1. SM contention, the leading hypothesis. An intra-node NVLink all-gather is
+#      executed by copy kernels on the GPU's own SMs; a cross-node one is
+#      executed by the NIC over RDMA and costs no SMs at all. So on NVLink the
+#      gathers steal SMs from the compute they are supposed to be overlapping
+#      with, and over RoCE they genuinely overlap. That predicts exactly the
+#      observed shape -- fastest link, worst per byte -- and it predicts DDP
+#      shows none of it, because DDP issues one big allreduce at the end of the
+#      step instead of many small gathers interleaved with compute. Signature:
+#      `fwd` and `bwd_inner` inflated on within-pair, comm timers flat.
+#   2. DeepSpeed's stage-3 runtime, not the wire at all -- the same finding as
+#      fsdp-full beating zero3 by 3x, showing up again at 2 ranks. Signature:
+#      as above, but the inflation does not track the link type.
+#   3. NCCL picking a different algorithm or protocol at world size 2 on an
+#      intra-node NVLink pair than for the same 2 ranks over RoCE. That choice
+#      is made at init, not visible in the timers: add
+#      `export NCCL_DEBUG_SUBSYS=INIT,TUNING` to configs/env.sh (it is sourced
+#      on both ranks) and re-run with `--nccl-debug INFO`. Signature: a
+#      different algo/proto line for within-pair than for across-nodes.
+#
+# WHERE THE OUTPUT GOES. DeepSpeed logs its timers on global rank 0 only, and
+# sweep.py does not redirect rank 0 -- peer ranks land in
+# results/generated/<run_id>/rank1.log, rank 0 inherits the terminal. So the
+# one thing this matrix exists to collect is not written to disk unless you
+# ask for it:
+#
+#   python -u -m cluster_bench.sweep configs/matrix/2b_anomaly_profile.yaml \
+#     2>&1 | tee results/2b_anomaly_profile.log
+#
+# Then read `grep 'time (ms)'` on that file. grad_accum is 1 here, so the
+# `*_microstep` lines and their aggregates carry the same numbers -- the
+# duplication is not telling you anything.
 #
 # `wall_clock_breakdown` is a DeepSpeed config field, so it changes the zero3
 # cells and does nothing to the ddp ones. That asymmetry is why the p50s here

@@ -126,6 +126,16 @@ class RunSpec:
     # Barrier + cuda sync around every step. Costs a little absolute
     # throughput but is applied identically to every config, and without it
     # step boundaries smear across async collectives.
+    #
+    # "Applied identically" is not the same as "equal effect", and the 2B
+    # profiling run (2026-08-15) showed why: DeepSpeed's own timers account for
+    # only 82-93% of the step, and the exposed comm is in the remainder, drained
+    # at this sync. A config with more async comm in flight at the step boundary
+    # -- ZeRO-3 far more than DDP -- has more of it exposed here, where in real
+    # training some would overlap into the next step. So the bias differs per
+    # backend and does not cancel in comm_overhead. Bound it with
+    # `--no-sync-each-step` on ddp/zero3/fsdp-full before quoting the backend gap
+    # as a property of DeepSpeed; see CLAUDE.md result 7.
     sync_each_step: bool = True
 
     # --- deepspeed tuning (pinned, see module docstring) ---
