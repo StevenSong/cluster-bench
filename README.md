@@ -211,13 +211,23 @@ exclusions, all reported rather than silently applied:
 | Different optimizer precision | The bf16/fp32-master split above separates the curves within two optimizer steps however correct both cells are |
 | Different `tp_size` | A TP group shares one batch, so sample order and `num_items_in_batch` both shift |
 | Different (placement, tokens) group | A different global batch is a legitimately different curve |
+| Different corpus (`dataset.num_samples`) | `dataset_num_samples: 0` sizes the corpus from warmup + measure steps, so a matrix with a different step budget reshuffles the batch order |
 
-So a full check needs one pass per family, and the reference has to come from
-inside the group being gated:
+That last one is the subtle one, and it is why `gate_correctness.yaml`'s
+`warmup_steps: 0 / measure_steps: 60` cells cannot be gated against 2A's
+`20 / 80` cells: same seed, same byte-identical head-of-split text, but
+`len(dataset)` differs and HF's seeded `RandomSampler` permutes over the dataset
+length. It presents as every cell in the matrix failing the gate by the same
+~0.17, which looks like a systematic bug and is only a different batch order.
+
+`warmup_steps` is a measurement-discard count, not an LR warmup, and `on_log`
+records the curve from step 1 regardless — so the loss curve does not need
+`warmup_steps: 0`, and 2A's own runs are usable as gate references directly. A
+full check is then one pass per family with no dedicated gate cells at all:
 
 ```bash
-python -m cluster_bench.report --reference ddp__full__t8192__s4096__gate
-python -m cluster_bench.report --reference zero3__full__t8192__s4096__gate
+python -m cluster_bench.report --reference ddp__full__t8192__s4096
+python -m cluster_bench.report --reference zero3__full__t8192__s4096
 ```
 
 Each pass ends with a line stating how many cells it actually compared. A gate

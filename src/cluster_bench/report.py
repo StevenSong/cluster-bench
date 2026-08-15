@@ -64,6 +64,27 @@ def _group_key(r: dict[str, Any]) -> tuple:
     return (r["placement"]["name"], r["tokens_per_gpu_step"], r["spec"]["seq_len"])
 
 
+def _data_key(r: dict[str, Any]) -> tuple:
+    """What the sampler walked. Two cells share a loss curve only if this matches.
+
+    `dataset_num_samples: 0` means "size the corpus from warmup + measure
+    steps" (data.py::_n_examples_needed), so a matrix with a different step
+    budget gets a different `len(dataset)` -- and HF's seeded RandomSampler
+    permutes over the dataset length, so the batch order changes even though
+    the text is byte-identical head-of-split in both. The gate matrix's 0+60
+    and 2A's 20+80 therefore walk different orders from step 1, which reads as
+    a uniform ~0.17 loss deviation across every strategy at once.
+    """
+    d = r.get("dataset", {})
+    return (
+        d.get("source"),
+        d.get("synthetic"),
+        d.get("num_samples"),
+        d.get("packing"),
+        d.get("packing_strategy"),
+    )
+
+
 def annotate(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     baselines = {
         _group_key(r): r["step_time_p50_s"]
@@ -173,6 +194,19 @@ def check_loss_curves(
         # pointed at results/runs this is most of the matrix, and thirty lines
         # saying "2B and 2C exist" would bury the cells that were checked.
         if _group_key(r) != _group_key(ref):
+            continue
+        # Reported, not silent: unlike a placement or token-count difference,
+        # this one looks like every cell failing the gate by the same amount,
+        # and the cells are otherwise in the same comparison group.
+        if _data_key(r) != _data_key(ref):
+            problems.append(
+                f"{r['run_id']}: not gated -- walked a different corpus "
+                f"({r.get('dataset', {}).get('num_samples')} samples vs the "
+                f"reference's {ref.get('dataset', {}).get('num_samples')}). "
+                "dataset_num_samples=0 sizes the corpus from warmup+measure "
+                "steps, so a different step budget reshuffles the batch order. "
+                "Gate against a reference run with the same step budget."
+            )
             continue
         # A TP cell cannot be gated against a non-TP reference, and not because
         # anything is wrong with it: its TP group is fed one batch, so the
