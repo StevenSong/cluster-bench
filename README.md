@@ -127,18 +127,44 @@ vocab size and embedding tying into the results JSON.
 | File | What it varies | Cells | Budget |
 |---|---|---|---|
 | `configs/matrix/2a_sharding.yaml` | 9 sharding strategies, 8 GPUs | 9 | ~40 min |
-| `configs/matrix/2b_placement.yaml` | 6 GPU placements × top 3 from 2A | ≤18 | ~1.5 hr |
-| `configs/matrix/2c_tokens.yaml` | 5 token counts × top 3 from 2A | 15 | ~1.5 hr |
-| `configs/matrix/gate_correctness.yaml` | loss curve on real data | 4 | — |
+| `configs/matrix/2b_placement.yaml` | 6 GPU placements × 3 configs | 18 | ~1.5 hr |
+| `configs/matrix/2c_tokens.yaml` | 5 token counts × 3 configs | 15 | ~1.5 hr |
+| `configs/matrix/gate_correctness.yaml` | loss curve on real data | 5 | — |
+| `configs/matrix/2b_anomaly_profile.yaml` | `wall_clock_breakdown` on the 2-GPU cells | 6 | ~15 min |
 
-**2A** decomposes ZeRO's cost — `ddp → zero1 → zero2 → zero3` isolates
-optimizer state, then gradients, then parameters — and then varies *only* the
-param-gather scope: flat (global) → hpz4 (node-local) → hpz2 (pair-local).
+**2A** decomposes ZeRO's cost — `ddp → zero0 → zero1 → zero2 → zero3` isolates
+the runtime itself, then optimizer state, then gradients, then parameters — and
+then varies *only* the param-gather scope: flat (global) → hpz4 (node-local) →
+hpz2 (pair-local).
+
+Two rows changed on 2026-08-15, after the first full pass:
+
+* **`fsdp-hybrid` dropped.** It reported 12.0 GB peak, identical to `fsdp-full`
+  to the decimal, and a node-local parameter replica cannot be free — the
+  DeepSpeed equivalent costs +1.6 GB at hpz4 and +3.2 GB at hpz2 on the same
+  model. accelerate 1.14 took `fsdp_shard_size` under `fsdp_version: 2` and
+  silently did not build the 2-D mesh, so the row was FULL_SHARD measured twice.
+  Restoring it means the FSDP1 spelling (`fsdp_sharding_strategy:
+  HYBRID_SHARD`) and confirming it engaged **by peak memory going up**, not by
+  the key being present in the config — which is precisely what fooled it.
+* **`zero0` added.** DeepSpeed with ZeRO off: the candidate repair for the
+  denominator, described under "Reading the results" below.
+
+2B and 2C now run `ddp / zero3 / fsdp-full`. They were run against
+`zero3-hpz2`, which measured slower than flat ZeRO-3 in every cell of every
+matrix, through a config whose step time is mostly not the fabric.
 
 **2B** is the placement study. The sharp comparison is `one-node`
 (NVLink + PCIe) against `pair-per-node` (NVLink + RoCE, **zero PCIe**): same
 four GPUs' worth of compute, and a direct answer to the PCIe-vs-network
 question. Only possible with a model this small.
+
+Read 2B on **absolute p50 at a fixed GPU count, not on the overhead column**.
+Everywhere else the denominator is fixed and the ratio is the point; here each
+placement is divided by its own DDP cell, so the denominator moves with the row.
+In the first pass that inverted the ranking — `within-pair` showed the worst
+ZeRO-3 overhead of any placement (+47.1%) only because DDP is fastest on
+NVLink, while its absolute step time tied with `across-pairs`.
 
 Placements in `placement.py` are written in **node0's device order**. Peer
 nodes enumerate their GPUs in the opposite order, so `Placement.devices_for()`
@@ -188,11 +214,45 @@ every cell, so it does not reorder 2A, and it does not touch the FSDP2-vs-ZeRO-3
 cross-check in rows 7–8, which is a clean comparison between two fp32-master
 backends.
 
-No flag makes DDP match. Loading fp32 so it keeps master weights also makes its
-gradients fp32 and doubles its all-reduce volume, corrupting the denominator in
-the one dimension this study exists to measure. Pure-bf16 DDP has the right
-*wire* profile — bf16 gradients, the same as DeepSpeed's bf16 reduce — and only
-its optimizer step is cheap, so the bias is documented rather than removed.
+No flag makes the `ddp` cell itself match. Loading fp32 so it keeps master
+weights also makes its gradients fp32 and doubles its all-reduce volume,
+corrupting the denominator in the one dimension this study exists to measure.
+Pure-bf16 DDP has the right *wire* profile — bf16 gradients, the same as
+DeepSpeed's bf16 reduce — and only its optimizer step is cheap.
+
+**`zero0` is the other route: keep the wire profile, change the runtime.**
+DeepSpeed with `stage: 0` reduces bf16 gradients exactly as the DDP cell does,
+but keeps fp32 master weights like every other DeepSpeed cell — so if it costs
+no parameter communication, it is a like-for-like denominator that the
+correctness gate also covers, and `--baseline zero0` removes the bias above
+instead of documenting it.
+
+That "if" is the whole row, and it is not decidable from the config file. With
+`bf16.enabled` and ZeRO off, DeepSpeed's engine builds a `BF16_Optimizer`, which
+partitions the fp32 master weights across the DP group and all-gathers the
+updated bf16 parameters at the end of every step — ZeRO-1's wire profile under a
+stage-0 label, with no flag to disable it. Assuming otherwise would hide an
+all-gather inside the denominator and deflate every overhead number in the
+study, which is the same failure as the `fsdp-hybrid` row above.
+
+So `report.check_baseline_candidates` reads the answer off the runs, and both
+answers are worth having:
+
+| `zero0` lands | Meaning | What to do |
+|---|---|---|
+| within ~3% of `ddp` | stage 0 really is zero-param-comm | switch to `--baseline zero0`; the denominator comes under the gate |
+| level with `zero1` | `BF16_Optimizer` is partitioning and all-gathering | keep `--baseline ddp`; read the row as DeepSpeed's fixed per-step runtime floor |
+
+The second reading is not a consolation prize. 2A puts roughly two thirds of
+flat ZeRO-3's exposed cost somewhere other than the fabric — `fsdp-full` moves
+the same bytes for 0.154 s/step against `zero3`'s 0.456 s, and beats `zero1` and
+`zero2`, which communicate strictly less — and `zero0 − ddp` measures that floor
+directly.
+
+The `vs` column in the table names the denominator each row was divided by.
+Groups that did not run the requested baseline fall back to the next candidate
+rather than blanking, so the column is the only thing that says a row changed
+reference.
 
 Which backend keeps master weights was **measured, not assumed** — the two
 accelerate backends do not agree, and the intuitive reading (that FSDP2 follows
@@ -240,10 +300,11 @@ full check is then one pass per family with no dedicated gate cells at all:
 python -m cluster_bench.report --reference zero3__full__t8192__s4096
 ```
 
-That one pass covers rows 2, 3, 5, 6, 7 and 8 — every fp32-master cell in 2A.
-Row 9 (`tp2-zero2`) is excluded on `tp_size`, and row 1 (`ddp`) is the only
-bf16-in-place cell in the matrix, so it has nothing to be gated against: giving
-it a peer means running a second DDP cell at the same step budget. That repeat
+That one pass covers every fp32-master cell in 2A — `zero0`, `zero1`, `zero2`,
+`zero3`, both hpZ rows and `fsdp-full`. `tp2-zero2` is excluded on `tp_size`,
+and `ddp` is the only bf16-in-place cell in the matrix, so it has nothing to be
+gated against: giving it a peer means running a second DDP cell at the same step
+budget, or retiring it as the denominator in favour of `zero0`. That repeat
 also measures the run-to-run noise floor, which is what `--loss-tol` should be
 set from — the fp32-master family currently spans 0.006–0.022 pairwise, so the
 default 0.02 sits just inside the noise and flags a few cells spuriously.

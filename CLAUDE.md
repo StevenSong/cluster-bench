@@ -25,7 +25,52 @@ README.md carries the full operating manual. This file is the standing plan.
 ## Status
 - Tier 0 (topology validation, nccl-tests, rail/ring verification) — DONE
 - Tier 1 (NCCL env var sweep) — DONE
-- **Tier 2 (sharding strategy) — this is the current work**
+- **Tier 2 (sharding strategy) — first full pass of 2A/2B/2C measured
+  2026-08-15; second pass in flight (see Results). 31B confirm not started.**
+
+## Results of the first pass (2026-08-15) — read this before planning runs
+Convert overhead back to **exposed comm seconds/step** (p50 minus matched DDP
+p50); the ratio hides the finding. At full/8192: fsdp-full 0.154, zero2 0.196,
+zero1 0.198, tp2-zero2 0.367, hpz2 0.437, zero3 0.456, hpz4 0.466.
+
+1. **~2/3 of flat ZeRO-3's cost is not the fabric.** FSDP2 FULL_SHARD moves the
+   same bytes as ZeRO-3 for a third of the time, and beats ZeRO-1/ZeRO-2, which
+   communicate strictly less. The residual is DeepSpeed's stage-3 runtime.
+   Whether it amortizes at 31B (an 8× longer step) is now the central question.
+2. **hpZ is dead.** hpz2 is slower than flat ZeRO-3 in *every* cell of 2A, 2B
+   and 2C; hpz4 too. Not a config that failed to engage — memory is +3.2/+1.6 GB,
+   exactly the secondary-partition arithmetic. It follows from (1): hpZ
+   optimizes the param gather, and the gather is not the cost. Do not take hpZ
+   to 31B; +3.2 GB at 4B extrapolates to **+25 GB/GPU at 31B**.
+3. **Cross-pair PCIe is worse than the network** — the question driving the
+   whole repo. Read it off the DDP rows, which are a clean link probe (one
+   allreduce, same volume). 2 GPUs: NVLink 0.9097 < RoCE 0.9293 < **PCIe
+   0.9759**. within-pair vs across-pairs is perfectly controlled (same node,
+   same ranks) and the PCIe hop costs 7.3%. 4 GPUs: pair-per-node 0.9581 beats
+   one-node 1.0123 by 5.7%. Same direction in the ZeRO-3 rows.
+4. **2C crossover: between 8192 and 16384 tok/GPU/step.** Exposed comm is flat
+   at ~0.44 s/step from 2048 to 8192 (comm bytes don't depend on batch size),
+   then collapses to 0.195 at 16384 and 0.094 at 32768. Portable form: *this
+   cluster exposes ~0.45 s/step of un-hidden ZeRO-3 traffic for a 4B model, and
+   it stops mattering once compute per step exceeds ~1.5–2 s.* Trust 8192 and
+   up — DDP goes 0.7236 → 0.7690 s for 2× the tokens at the bottom of the
+   range, so those points measure fixed cost against fixed cost.
+5. **TP=2 costs ~0.17 s/step** even entirely on NVLink (0.367 against zero2's
+   0.196), as predicted: TP all-reduces are synchronous and unhideable.
+6. **Unexplained: the 2-GPU same-node ZeRO-3 cells.** Exposed comm normalised
+   by the (N−1)/N gather factor is 0.48–0.52 everywhere except across-pairs
+   (0.71) and within-pair (0.86) — the fastest link, worst per byte. Not noise,
+   not memory pressure. `configs/matrix/2b_anomaly_profile.yaml` probes it.
+   Until it is explained, placement conclusions rest on the DDP rows and the
+   4-GPU pair.
+
+**Correction to the proxy argument.** "P cancels" holds for the bytes, but
+comm/compute = 6·A/(8·T·B) and *achieved* FLOP/s A does not cancel. The DDP
+ceiling here is ~250–260 TFLOP/s at 8192 tok/GPU (~25% MFU); 31B at hidden 5120
+should reach 40–50%, which pushes overheads **up** by up to ~1.7×, partly offset
+by the large-message bandwidth gain (28 MB → ~220 MB per rank) pushing down.
+Both corrections are large and are being assumed to cancel. That makes the 31B
+confirm the only test of the proxy, not a formality.
 
 ## Proxy model: dense, full-attention ~4B (Qwen3-4B)
 **Verify before starting: dense not MoE, full attention not hybrid, layer count, hidden
@@ -69,16 +114,38 @@ Report all overheads against this, not against spec FLOPS.
 | # | Config | Param gather | Grad reduce | Purpose |
 |---|---|---|---|---|
 | 1 | DDP | none | global | **compute ceiling / denominator** |
-| 2 | ZeRO-1 | none | global | optimizer sharding only |
-| 3 | ZeRO-2 | none | global | + grad sharding |
-| 4 | ZeRO-3 flat (hpZ=0) | global | global | current baseline |
-| 5 | ZeRO-3 hpZ=4 | node-local | global | no cross-node gathers |
-| 6 | ZeRO-3 hpZ=2 | pair-local (NVLink) | global | no PCIe/RoCE gathers |
-| 7 | FSDP2 FULL_SHARD | global | global | cross-check vs #4 |
-| 8 | FSDP2 HYBRID_SHARD | node-local | global | cross-check vs #5 |
+| 2 | ZeRO-0 | none | global | like-for-like fp32-master denominator candidate |
+| 3 | ZeRO-1 | none | global | optimizer sharding only |
+| 4 | ZeRO-2 | none | global | + grad sharding |
+| 5 | ZeRO-3 flat (hpZ=0) | global | global | current baseline |
+| 6 | ZeRO-3 hpZ=4 | node-local | global | no cross-node gathers |
+| 7 | ZeRO-3 hpZ=2 | pair-local (NVLink) | global | no PCIe/RoCE gathers |
+| 8 | FSDP2 FULL_SHARD | global | global | cross-check vs #5 |
 | 9 | TP=2 × ZeRO-2(4) | in-pair (TP, not ZeRO) | global | only sane TP degree here |
 
-Rows 1→2→3→4 decompose ZeRO's cost: optimizer, then grads, then params.
+Rows 1→3→4→5 decompose ZeRO's cost: optimizer, then grads, then params.
+
+**Row 8 was FSDP2 HYBRID_SHARD; dropped 2026-08-15.** It reported 12.0 GB peak,
+identical to FULL_SHARD to the decimal, where a node-local replica has to cost
+memory (hpZ=4 costs +1.6 GB, hpZ=2 +3.2 GB on the same model). accelerate 1.14
+accepted `fsdp_shard_size` under `fsdp_version: 2` and did not build the 2-D
+mesh, so the row measured FULL_SHARD twice. Restoring it needs the FSDP1
+spelling (`fsdp_sharding_strategy: HYBRID_SHARD`) and verification **by peak
+memory rising**, not by the key being in the config. Low priority: its job was
+cross-checking hpZ, and hpZ is dead (below).
+
+**Row 2 added 2026-08-15** to repair the denominator. DDP is the only
+bf16-in-place cell — it holds bf16 params, grads and Adam moments — so it is
+both the denominator and the one cell no reference loss curve can gate.
+DeepSpeed stage 0 has DDP's wire profile with fp32 master weights, which would
+fix both. **But it may not be zero-param-comm**: with `bf16.enabled` and ZeRO
+off, deepspeed builds a `BF16_Optimizer` that partitions the fp32 master
+weights across the DP group and all-gathers the updated bf16 params every step
+— ZeRO-1's pattern under a stage-0 label, with no flag to disable it. Do not
+assume either way; `report.check_baseline_candidates` decides from the data.
+Within ~3% of DDP → switch to `--baseline zero0`. Level with ZeRO-1 → keep DDP
+and read the row as DeepSpeed's fixed per-step runtime floor, which is worth
+having on its own (see Results below).
 
 **Row 9 is ZeRO-2, not ZeRO-3** (changed 2026-08-14): deepspeed 0.19.2 asserts
 `zero_optimization_stage() <= 2` whenever autotp is on. It costs the row nothing —
@@ -92,8 +159,17 @@ assert, but taking that upgrade means re-running all of 2A on a new runtime.
 stays global (crosses RoCE) in every config. Gathers ≈ 14 of ~21 GB/step, so **hpZ's
 benefit is capped at ~2/3 of ZeRO-3's comm**. A larger measured win means something's wrong.
 
-## Matrix 2B — placement study (top 3 configs from 2A)
-Pin via `CUDA_VISIBLE_DEVICES` + host list.
+## Matrix 2B — placement study (`ddp / zero3 / fsdp-full`)
+Pin via `CUDA_VISIBLE_DEVICES` + host list. Strategies revised 2026-08-15:
+`zero3-hpz2` out (slower than flat everywhere), `fsdp-full` in — the first pass
+probed the fabric through a config whose step time is mostly *not* the fabric.
+18 cells now, not 15: hpz2 needed ≥4 GPUs and skipped the three 2-GPU rows.
+
+**Read 2B on absolute p50 at fixed GPU count, never on the overhead column** —
+each placement divides by its own DDP cell, so the denominator moves with the
+row. First pass: within-pair showed the worst ZeRO-3 overhead of any placement
+(+47.1%) purely because DDP is fastest on NVLink, while its absolute step time
+tied with across-pairs.
 
 | Placement | GPUs | Links |
 |---|---|---|
@@ -108,9 +184,17 @@ Row 5 vs row 4 is the sharp comparison — a clean 4-GPU-vs-4-GPU answer to the
 PCIe-vs-network question. Only possible with a model this small.
 
 ## Matrix 2C — tokens/GPU crossover
-Top 3 configs × {2048, 4096, 8192, 16384, 32768} tok/GPU/step (vary micro-batch,
-fixed 4096 seq len). Finds where comm stops mattering. **Most durable output** — a
+`ddp / zero3 / fsdp-full` × {2048, 4096, 8192, 16384, 32768} tok/GPU/step (vary
+micro-batch, fixed 4096 seq len; the 2048 cell drops to seq_len 2048 because
+micro_batch must be ≥1, so it is the one point where attention's quadratic term
+also moves). Finds where comm stops mattering. **Most durable output** — a
 portable cluster characteristic that transfers to un-benchmarked models.
+
+Strategies revised 2026-08-15: `zero3-hpz2` out, `fsdp-full` in. The first pass
+found the crossover (result 4 above), but measured it through DeepSpeed's
+stage-3 runtime. Whether the same crossover holds for a backend not paying that
+cost decides whether the number is a property of the cluster or of DeepSpeed —
+which is the whole claim to durability.
 
 ## Data: real corpus, `wrapped` packing (changed 2026-08-05)
 Timing runs use the real dataset, not synthetic. The control survives because
@@ -186,9 +270,20 @@ Everything the plan needed is built:
 
 Still open / needs on-cluster verification (no GPU on the dev machine, so none
 of this has executed):
-- **FSDP2 hybrid**: `accel_config.py` emits `fsdp_shard_size` for the 2-D mesh.
-  Confirm accelerate 1.14 honors that key for `fsdp_version: 2`; if not, rows 8
-  of 2A needs the v1 `fsdp_sharding_strategy: HYBRID_SHARD` spelling instead.
+- ~~**FSDP2 hybrid**: confirm accelerate 1.14 honors `fsdp_shard_size` for
+  `fsdp_version: 2`~~ — ANSWERED on-cluster 2026-08-15: it does not. The key is
+  accepted, the 2-D mesh is not built, and the cell ran FULL_SHARD while
+  labelled HYBRID_SHARD. Caught by peak memory (12.0 GB, identical to
+  fsdp-full's, where a node-local replica must cost GB) — *not* by anything in
+  the config or the logs. Row dropped from 2A; `accel_config.py` no longer
+  emits the key. **The lesson generalizes: verify a locality feature engaged by
+  peak memory moving, not by the config containing the flag.** hpZ passes that
+  test (+3.2/+1.6 GB) and is trustworthy as a negative result; fsdp-hybrid
+  never did.
+- **`zero0` is a stage-0 label over a possibly ZeRO-1-shaped runtime** — see
+  row 2 above. The one thing that must not happen is quietly adopting it as the
+  denominator without checking; `report.check_baseline_candidates` runs the
+  check automatically on every report.
 - ~~**DeepSpeed AutoTP** for row 9 — verify 0.19.2 supports it for training~~ —
   ANSWERED on-cluster 2026-08-14: 0.19.2 supports autotp for training at ZeRO
   stage ≤ 2 only, asserting on stage 3. Row 9 is now `tp2-zero2`; `ds_config`

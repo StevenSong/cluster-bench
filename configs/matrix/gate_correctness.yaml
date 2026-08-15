@@ -42,6 +42,11 @@ placements: [full]
 
 strategies:
   - ddp
+  # The cell that exists to close the hole described above: fp32 master weights
+  # like the rest of the DeepSpeed family, but no sharding, so if it is also a
+  # zero-param-comm ceiling it can replace ddp as the denominator and the
+  # denominator stops being ungated. report.check_baseline_candidates decides.
+  - zero0
   - zero3
   - zero3-hpz4
   - zero3-hpz2

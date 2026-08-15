@@ -20,6 +20,10 @@ def build(spec: RunSpec, strategy: Strategy) -> dict[str, Any]:
     if not strategy.uses_deepspeed:
         raise ValueError(f"{strategy.name} is not a DeepSpeed strategy")
 
+    # stage 0 is a real cell here (`zero0`), not a degenerate one: it is the
+    # candidate like-for-like denominator. DeepSpeed reads `stage: 0` as ZeRO
+    # off and ignores the rest of this block, but the block is emitted anyway so
+    # every cell's config differs only in the fields the strategy is varying.
     zero: dict[str, Any] = {
         "stage": strategy.zero_stage,
         "overlap_comm": spec.overlap_comm,

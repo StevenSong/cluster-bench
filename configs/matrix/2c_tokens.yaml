@@ -15,10 +15,20 @@ defaults:
   warmup_steps: 20
   measure_steps: 80
 
+# Strategies, revised 2026-08-15 after reading 2A. Was ddp/zero3/zero3-hpz2.
+#
+# zero3-hpz2 is out: it measured slower than flat zero3 at all five token
+# counts. fsdp-full is in, and it is the interesting curve now -- the first
+# pass found ~0.44 s/step of exposed cost under zero3 that is flat from 2048 to
+# 8192 tok/GPU and then collapses (0.195 s at 16384, 0.094 s at 32768), but
+# fsdp-full moves the same bytes for 0.154 s at 8192. Whether the crossover
+# lands at the same place for a backend that is not paying DeepSpeed's stage-3
+# runtime cost is the question this matrix now exists to answer, and it decides
+# whether the crossover is a property of the cluster or of DeepSpeed.
 strategies:
   - ddp
   - zero3
-  - zero3-hpz2
+  - fsdp-full
 
 placements: [full]
 

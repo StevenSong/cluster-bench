@@ -22,6 +22,19 @@ from typing import Any, Iterable
 # config, or a token count that isn't actually matched.
 HPZ_MAX_PLAUSIBLE_RECOVERY = 2 / 3
 
+# Strategies that can serve as the zero-param-comm denominator, best first.
+# `ddp` is the measured compute ceiling; `zero0` is the same thing routed
+# through DeepSpeed so that it keeps fp32 master weights and can be gated --
+# if it turns out to cost no param comm. See check_baseline_candidates.
+BASELINE_STRATEGIES = ("ddp", "zero0")
+
+# How close zero0 has to sit to ddp to be usable as a like-for-like
+# denominator. The fp32 master weights alone cost an Adam step over ~64-80 GB
+# of traffic instead of ~32 GB -- order 15 ms on a ~1 s step, so ~1.5%. Three
+# percent leaves room for that plus run-to-run noise, and nothing like enough
+# room for a per-step all-gather of every parameter.
+BASELINE_LIKE_FOR_LIKE_TOL = 0.03
+
 # Backends whose optimizer keeps fp32 master weights. DeepSpeed's bf16 path
 # holds an fp32 partitioned copy of every parameter and applies the Adam update
 # in fp32; accelerate's FSDP2 path does the same. Plain DDP does not:
@@ -94,19 +107,98 @@ def _data_key(r: dict[str, Any]) -> tuple:
     )
 
 
-def annotate(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    baselines = {
-        _group_key(r): r["step_time_p50_s"]
-        for r in runs
-        if r["strategy"]["name"] == "ddp" and "step_time_p50_s" in r
-    }
+def _p50_by_group(runs: list[dict[str, Any]]) -> dict[tuple, dict[str, float]]:
+    """{(placement, tokens, seq_len): {strategy_name: p50}}."""
+    out: dict[tuple, dict[str, float]] = {}
     for r in runs:
-        base = baselines.get(_group_key(r))
+        if "step_time_p50_s" in r:
+            out.setdefault(_group_key(r), {})[r["strategy"]["name"]] = r[
+                "step_time_p50_s"
+            ]
+    return out
+
+
+def annotate(
+    runs: list[dict[str, Any]], baseline: str = "ddp"
+) -> list[dict[str, Any]]:
+    """Attach each run's denominator, per (placement, tokens, seq_len) group.
+
+    The requested baseline is used where the group has one, and the group falls
+    back through BASELINE_STRATEGIES otherwise -- 2B and 2C do not necessarily
+    run every baseline candidate at every placement, and half a table of dashes
+    is worse than a table that says which denominator each row used. Which one
+    it was is recorded per run and printed, because an overhead number against
+    an unstated denominator is not a number.
+    """
+    order = [baseline] + [s for s in BASELINE_STRATEGIES if s != baseline]
+    by_group = _p50_by_group(runs)
+    for r in runs:
+        group = by_group.get(_group_key(r), {})
+        name = next((s for s in order if s in group), None)
+        r["_baseline_name"] = name
+        base = group.get(name) if name else None
         r["_baseline_p50"] = base
         r["_comm_overhead"] = (
             r["step_time_p50_s"] / base - 1 if base and "step_time_p50_s" in r else None
         )
     return runs
+
+
+def check_baseline_candidates(runs: list[dict[str, Any]]) -> list[str]:
+    """Decide, from the measurement, whether zero0 is a usable denominator.
+
+    The headline metric divides by a DDP cell that runs different optimizer
+    arithmetic from every cell it is the denominator for, and that no reference
+    loss curve can be gated against. `zero0` -- DeepSpeed with ZeRO off -- is
+    the candidate fix: fp32 master weights, so it is in the same numerical
+    family, with no sharding, so it should cost no parameter communication.
+
+    "Should" is the whole problem. With `bf16.enabled` and ZeRO off, DeepSpeed
+    builds a BF16_Optimizer, which partitions the fp32 master weights over the
+    DP group and all-gathers the updated bf16 parameters every step. That is
+    ZeRO-1's wire profile under a stage-0 label, and nothing in the config says
+    so. Assuming it away would put an all-gather inside the denominator and
+    deflate every overhead number in the study -- the same class of error as
+    the `fsdp-hybrid` row that measured FULL_SHARD twice.
+
+    So this reads the answer off the runs instead: zero0 next to ddp means the
+    denominator can be repaired, zero0 next to zero1 means it cannot, and the
+    row is a measurement of DeepSpeed's fixed per-step cost instead.
+    """
+    notes = []
+    for key, group in sorted(_p50_by_group(runs).items()):
+        ddp, zero0 = group.get("ddp"), group.get("zero0")
+        if not ddp or not zero0:
+            continue
+        line = f"{key[0]}/t{key[1]}: zero0 {zero0 / ddp - 1:+.1%} vs ddp"
+        zero1 = group.get("zero1")
+        if zero1:
+            line += f", {zero0 / zero1 - 1:+.1%} vs zero1"
+
+        if zero0 / ddp - 1 <= BASELINE_LIKE_FOR_LIKE_TOL:
+            line += (
+                " -- stage 0 costs no param comm here, so zero0 is a valid "
+                "like-for-like denominator. Re-run with --baseline zero0: the "
+                "overhead numbers lose the bf16-optimizer bias and the "
+                "denominator comes under the correctness gate."
+            )
+        elif zero1 and abs(zero0 - zero1) < abs(zero0 - ddp):
+            line += (
+                " -- level with zero1, not ddp. DeepSpeed's BF16_Optimizer is "
+                "partitioning the fp32 master weights and all-gathering the "
+                "updated params each step, so stage 0 is ZeRO-1-shaped and "
+                "cannot be the zero-param-comm ceiling. Keep --baseline ddp. "
+                "What this row does measure is DeepSpeed's fixed per-step "
+                "runtime floor, which is the useful half of the question."
+            )
+        else:
+            line += (
+                " -- between ddp and zero1 (or zero1 not in this group). Not "
+                "safe as a denominator on this evidence; run zero1 in the same "
+                "group, or profile the cell, before switching --baseline."
+            )
+        notes.append(line)
+    return notes
 
 
 def check_hpz_plausibility(runs: list[dict[str, Any]]) -> list[str]:
@@ -328,7 +420,8 @@ def table(runs: Iterable[dict[str, Any]]) -> str:
     )
     head = (
         f"{'strategy':<14} {'placement':<14} {'tok/gpu':>8} {'p50 s':>8} "
-        f"{'p95 s':>8} {'p95/p50':>8} {'tok/s/gpu':>10} {'peak GB':>8} {'overhead':>9}"
+        f"{'p95 s':>8} {'p95/p50':>8} {'tok/s/gpu':>10} {'peak GB':>8} "
+        f"{'overhead':>9} {'vs':>7}"
     )
     lines = [head, "-" * len(head)]
     for r in rows:
@@ -340,7 +433,11 @@ def table(runs: Iterable[dict[str, Any]]) -> str:
             f"{_fmt(r.get('straggler_ratio'), '.2f'):>8} "
             f"{_fmt(r.get('tokens_per_s_per_gpu'), '.0f'):>10} "
             f"{_fmt(r.get('peak_mem_allocated_gb'), '.1f'):>8} "
-            f"{_fmt(r.get('_comm_overhead'), '+.1%'):>9}"
+            f"{_fmt(r.get('_comm_overhead'), '+.1%'):>9} "
+            # Which denominator this row's overhead is against. A group without
+            # the requested baseline falls back rather than blanking, so this
+            # column is the only thing that says a row changed reference.
+            f"{r.get('_baseline_name') or '-':>7}"
         )
     return "\n".join(lines)
 
@@ -382,19 +479,26 @@ def main() -> None:
                          "are gated against it; the rest are reported as not "
                          "gated, so a full sweep needs one pass per family")
     ap.add_argument("--loss-tol", type=float, default=0.02)
+    ap.add_argument("--baseline", default="ddp", choices=BASELINE_STRATEGIES,
+                    help="strategy whose step time is the denominator of "
+                         "comm_overhead. Groups without it fall back to the "
+                         "next candidate; the `vs` column says which each row "
+                         "used. Only switch to zero0 once "
+                         "check_baseline_candidates says it costs no param comm")
     ap.add_argument("--json-out", type=Path, default=None)
     args = ap.parse_args()
 
     runs = load(args.runs_dir)
     if not runs:
         raise SystemExit(f"no runs found in {args.runs_dir}")
-    runs = annotate(runs)
+    runs = annotate(runs, args.baseline)
 
     print(table(runs))
 
     for label, notes in (
         ("provenance", provenance_spread(runs)),
         ("token control", check_token_control(runs)),
+        ("baseline", check_baseline_candidates(runs)),
         ("plausibility", check_hpz_plausibility(runs)),
         ("optimizer precision", check_precision_class_evidence(runs)),
         (

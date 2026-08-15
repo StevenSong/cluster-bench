@@ -8,6 +8,15 @@
 # Cells whose (strategy, placement) pair is not measurable -- hpz=4 on a 2-GPU
 # placement, say -- are skipped automatically rather than silently degraded.
 #
+# READ THIS MATRIX ON ABSOLUTE p50, NOT ON THE OVERHEAD COLUMN. Everywhere else
+# in the study the denominator is fixed and the ratio is the point; here the
+# denominator moves with the row, because each placement is divided by its own
+# DDP cell. In the first pass that inverted the ranking: `within-pair` showed
+# the worst ZeRO-3 overhead of any placement (+47.1%) purely because DDP is
+# fastest on NVLink, while its absolute step time was a dead heat with
+# `across-pairs`. The overhead column answers "what does sharding cost on these
+# links"; only p50 at a fixed GPU count answers "which links are faster".
+#
 # Budget: up to 18 cells, ~1.5 hr. Edit `strategies` after reading 2A.
 
 defaults:
@@ -16,10 +25,25 @@ defaults:
   warmup_steps: 20
   measure_steps: 80
 
+# Strategies, revised 2026-08-15 after reading 2A. Was ddp/zero3/zero3-hpz2;
+# zero3-hpz2 is out and fsdp-full is in.
+#
+# The first pass measured placement through two configs whose step time is
+# dominated by DeepSpeed's stage-3 runtime rather than by the links -- fsdp-full
+# moves the same bytes as zero3 for a third of the exposed time -- so a
+# placement effect could easily have been buried under a cost that does not care
+# where the GPUs are. zero3 stays as the incumbent and for continuity with the
+# first pass; fsdp-full is the cell that actually probes the fabric.
+#
+# zero3-hpz2 measured slower than flat zero3 at every placement, including the
+# two it was designed for, so it is not worth 6 more cells.
+#
+# Cell count goes 15 -> 18: hpz2 needed >= 4 GPUs and was skipped on the three
+# 2-GPU placements, where fsdp-full runs.
 strategies:
   - ddp
   - zero3
-  - zero3-hpz2
+  - fsdp-full
 
 placements:
   - within-pair           # 2 GPU, NVLink only

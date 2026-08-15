@@ -92,11 +92,15 @@ def build(
             "fsdp_cpu_ram_efficient_loading": False,
             "fsdp_activation_checkpointing": False,  # HF trainer owns this
         }
-        if strategy.fsdp_hybrid:
-            # FSDP2 expresses hybrid sharding as a 2-D device mesh: shard
-            # within `fsdp_reshard_after_forward` groups of this size,
-            # replicate across them. One group == one node.
-            fsdp["fsdp_shard_size"] = placement.procs_per_machine
+        # No hybrid branch. It used to set `fsdp_shard_size` to
+        # placement.procs_per_machine, on the theory that FSDP2 expresses
+        # hybrid sharding as a 2-D device mesh (shard within groups of that
+        # size, replicate across them). accelerate 1.14 took the key without
+        # complaint and did not build the mesh: the cell reported 12.0 GB peak,
+        # identical to plain FULL_SHARD, where a node-local replica has to cost
+        # memory. The strategy was dropped rather than left emitting a config
+        # that reads correct and runs as something else -- see the note above
+        # `fsdp-full` in strategies.py for what restoring it requires.
         cfg["fsdp_config"] = fsdp
 
     else:

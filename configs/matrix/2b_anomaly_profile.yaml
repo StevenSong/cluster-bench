@@ -1,0 +1,67 @@
+# Profiling probe -- the 2-GPU same-node ZeRO-3 anomaly.
+#
+# 2B's first pass left one result that no bandwidth story explains. Normalising
+# each cell's exposed comm (zero3 p50 - matched ddp p50) by the per-GPU gather
+# volume factor (N-1)/N, so that 2-, 4- and 8-GPU cells can be compared:
+#
+#   across-nodes   0.48      one-node       0.49
+#   pair-per-node  0.49      full           0.52
+#   across-pairs   0.71      within-pair    0.86   <-- on the *fastest* link
+#
+# The four consistent cells sit within 8% of each other. The two outliers are
+# exactly the two placements that put 2 ranks on one node, and the worse of the
+# two is NVLink -- the link that should be cheapest per byte. It is not noise
+# (14% apart, 80 measured steps, p95/p50 1.26-1.28) and it is not memory
+# pressure (35.7 GB peak against 141 GB of card).
+#
+# Until this is explained, the placement conclusions rest on the DDP rows and
+# the 4-GPU pair. DDP shows none of it: within-pair is its fastest cell.
+#
+# Two candidates, and the two things this matrix collects tell them apart:
+#
+#   1. DeepSpeed's stage-3 runtime, not the wire. `wall_clock_breakdown: true`
+#      splits the step into its comm and optimizer phases; if the extra time is
+#      in the parameter-fetch/reduce accounting rather than in a longer
+#      collective, this is the same finding as fsdp-full beating zero3 by 3x,
+#      showing up again at 2 ranks.
+#   2. NCCL picking a different algorithm or protocol at world size 2 on an
+#      intra-node NVLink pair than it picks for the same 2 ranks over RoCE.
+#      That choice is made at init and printed by NCCL_DEBUG_SUBSYS=INIT,TUNING.
+#
+# `wall_clock_breakdown` is a DeepSpeed config field, so it changes the zero3
+# cells and does nothing to the ddp ones. That asymmetry is why the p50s here
+# are not comparable to the first pass and why the overhead column from this
+# matrix means nothing: the numerator is instrumented and the denominator is
+# not. **Do not read step times from this matrix.** Take the timings from
+# 2b_placement.yaml and the phase breakdown from here.
+#
+# ddp is included anyway, for one job: confirming the anomaly is still present
+# in this session before spending time reading a breakdown of it. The DDP link
+# ordering (NVLink 0.9097 < RoCE 0.9293 < PCIe 0.9759) should reproduce, and
+# within-pair should again be DDP's *fastest* cell while being ZeRO-3's worst
+# per byte. If that inversion does not reproduce, the anomaly was a transient
+# and there is nothing here to explain.
+#
+# `tag: profile` keeps these out of the timing runs' run_ids rather than
+# overwriting them.
+#
+# Budget: 6 cells, ~15 min.
+#
+#   python -m cluster_bench.sweep configs/matrix/2b_anomaly_profile.yaml
+
+defaults:
+  seq_len: 4096
+  micro_batch: 2
+  warmup_steps: 20
+  measure_steps: 80
+  wall_clock_breakdown: true
+  tag: profile
+
+strategies:
+  - ddp
+  - zero3
+
+placements:
+  - within-pair           # 2 GPU, NVLink only -- the anomaly
+  - across-pairs          # 2 GPU, PCIe only -- the second outlier
+  - across-nodes          # 2 GPU, RoCE only -- the control that behaves
