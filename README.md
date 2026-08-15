@@ -172,31 +172,42 @@ so `hpz=4` on 2 GPUs runs as flat ZeRO-3 while still being labelled hpz4 — tho
 cells are skipped with a printed reason.
 
 **Known bias in the headline metric: the DDP baseline runs cheaper optimizer
-arithmetic than the cells it is the baseline for.** `modeling.load` builds the
-model in bf16 and accelerate's `mixed_precision: bf16` does not upcast it, so
-the DDP and FSDP2 cells hold bf16 parameters, gradients and Adam moments and
-apply the update in place. DeepSpeed's bf16 path keeps an fp32 partitioned
-master copy of every parameter and applies the update in fp32. Two consequences:
+arithmetic than every cell it is the baseline for.** `modeling.load` builds the
+model in bf16 and `mixed_precision: bf16` does not upcast an already-bf16 model,
+so the DDP cell holds bf16 parameters, gradients and Adam moments and applies
+the update in place. Both DeepSpeed's bf16 path and accelerate's FSDP2 path keep
+an fp32 master copy of every parameter and apply the update in fp32. **Row 1 is
+the only cell in the matrix on the bf16 path**, which is unfortunate, because it
+is the denominator.
 
-* An Adam step over 4B parameters moves ~32 GB of memory traffic in bf16 against
-  ~64–80 GB with fp32 masters — order 15 ms on a ~1 s step. `step_time_ddp` is
-  that much faster than a like-for-like baseline, so every `comm_overhead` is
-  biased **up** by a point or two. The bias is uniform; it does not reorder 2A.
-* Rows 7–8 (FSDP2) take the accelerate path and rows 4–6 (ZeRO-3) do not, so the
-  cross-check between them differs in optimizer precision as well as in
-  sharding. FSDP2 gets the cheaper optimizer step for free.
+An Adam step over 4B parameters moves ~32 GB of memory traffic in bf16 against
+~64–80 GB with fp32 masters — order 15 ms on a ~1 s step. `step_time_ddp` is
+that much faster than a like-for-like baseline, so every `comm_overhead` is
+biased **up** by a point or two. The bias is uniform and applies equally to
+every cell, so it does not reorder 2A, and it does not touch the FSDP2-vs-ZeRO-3
+cross-check in rows 7–8, which is a clean comparison between two fp32-master
+backends.
 
-No flag makes them match. Loading fp32 so DDP keeps master weights also makes
-its gradients fp32 and doubles its all-reduce volume, corrupting the denominator
-in the one dimension this study exists to measure. Pure-bf16 DDP has the right
+No flag makes DDP match. Loading fp32 so it keeps master weights also makes its
+gradients fp32 and doubles its all-reduce volume, corrupting the denominator in
+the one dimension this study exists to measure. Pure-bf16 DDP has the right
 *wire* profile — bf16 gradients, the same as DeepSpeed's bf16 reduce — and only
 its optimizer step is cheap, so the bias is documented rather than removed.
 
-The symptom, if you ever need to identify this from a results JSON: a grad norm
-computed over bf16 gradients lands exactly on the bf16 grid (51.75, 39.75,
-27.125, 0.9921875), one computed in fp32 essentially never does.
-`report.check_precision_class_evidence` makes that check automatically and warns
-when a run's recorded norms contradict the backend it claims.
+Which backend keeps master weights was **measured, not assumed** — the two
+accelerate backends do not agree, and the intuitive reading (that FSDP2 follows
+DDP) is wrong. Three independent signals, worth knowing how to read because
+nothing announces this:
+
+* **Peak memory.** `ddp` 38.6 GB unsharded is exactly bf16 params + grads + bf16
+  Adam. `fsdp-full` 12.0 and `zero3` 13.2 sit where fp32 masters put them; a
+  pure-bf16 FSDP2 shard would have been ~8–9.
+* **Grad norms.** A norm over bf16 gradients lands exactly on the bf16 grid
+  (51.75, 39.75, 27.125, 0.9921875); one computed in fp32 essentially never
+  does. Only DDP's do. `report.check_precision_class_evidence` runs this check
+  automatically and warns when a run's norms contradict its declared backend.
+* **Loss curves.** `fsdp-full` sits 0.006–0.015 from every DeepSpeed cell over
+  100 steps, and 0.288 from DDP.
 
 Run the correctness gate before trusting any timing number. Every config must
 reproduce the reference loss curve at a fixed seed; this is what catches
@@ -226,9 +237,16 @@ records the curve from step 1 regardless — so the loss curve does not need
 full check is then one pass per family with no dedicated gate cells at all:
 
 ```bash
-python -m cluster_bench.report --reference ddp__full__t8192__s4096
 python -m cluster_bench.report --reference zero3__full__t8192__s4096
 ```
+
+That one pass covers rows 2, 3, 5, 6, 7 and 8 — every fp32-master cell in 2A.
+Row 9 (`tp2-zero2`) is excluded on `tp_size`, and row 1 (`ddp`) is the only
+bf16-in-place cell in the matrix, so it has nothing to be gated against: giving
+it a peer means running a second DDP cell at the same step budget. That repeat
+also measures the run-to-run noise floor, which is what `--loss-tol` should be
+set from — the fp32-master family currently spans 0.006–0.022 pairwise, so the
+default 0.02 sits just inside the noise and flags a few cells spuriously.
 
 Each pass ends with a line stating how many cells it actually compared. A gate
 that looks like it ran but checked nothing is the failure mode it exists to

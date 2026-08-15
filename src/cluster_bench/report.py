@@ -24,16 +24,25 @@ HPZ_MAX_PLAUSIBLE_RECOVERY = 2 / 3
 
 # Backends whose optimizer keeps fp32 master weights. DeepSpeed's bf16 path
 # holds an fp32 partitioned copy of every parameter and applies the Adam update
-# in fp32. The accelerate path (DDP, FSDP2) does not: modeling.load builds the
-# model in bf16 and `mixed_precision: bf16` does not upcast it, so parameters,
-# gradients and Adam moments are all bf16 and the update is applied in place.
+# in fp32; accelerate's FSDP2 path does the same. Plain DDP does not:
+# modeling.load builds the model in bf16, `mixed_precision: bf16` does not
+# upcast an already-bf16 model, so parameters, gradients and Adam moments are
+# all bf16 and the update is applied in place.
 #
 # At lr=6e-6 an update is a fraction of a bf16 ulp for a typical weight, so the
-# two paths train at measurably different rates -- the bf16 cells reach a higher
-# loss at the same step. That is a property of the numerics, not of the sharding
-# the cell exists to measure, so cells on different sides of this line cannot be
+# two paths train at measurably different rates -- DDP reaches a higher loss at
+# the same step. That is a property of the numerics, not of the sharding the
+# cell exists to measure, so cells on different sides of this line cannot be
 # gated against each other. See check_loss_curves.
-_FP32_MASTER_BACKENDS = {"deepspeed"}
+#
+# Measured on-cluster at 4B/8 GPUs rather than assumed, because the two
+# accelerate backends do *not* agree and the plausible reading was wrong:
+#   * peak memory: ddp 38.6 GB (pure bf16, unsharded) vs fsdp-full 12.0 and
+#     zero3 13.2 -- a pure-bf16 FSDP2 shard would have been ~8-9.
+#   * grad norms: DDP's land exactly on the bf16 grid, the rest do not.
+#   * loss curves: fsdp-full sits 0.006-0.015 from every DeepSpeed cell over
+#     100 steps and 0.288 from DDP.
+_FP32_MASTER_BACKENDS = {"deepspeed", "fsdp"}
 
 
 def _precision_class(r: dict[str, Any]) -> str:
@@ -276,10 +285,10 @@ def check_precision_class_evidence(runs: list[dict[str, Any]]) -> list[str]:
     a new backend was added -- and the gate is silently mis-grouping cells.
 
     Only the unambiguous direction is flagged. An fp32-master run whose every
-    norm is bf16-exact cannot be a coincidence, but a bf16-in-place run with
-    non-exact norms is expected in at least one case: FSDP2's mixed-precision
-    policy can reduce gradients in fp32 while parameters stay bf16, which is a
-    real configuration and not a contradiction.
+    norm is bf16-exact cannot be a coincidence, but a bf16-in-place run can
+    legitimately report a non-exact norm -- a mixed-precision policy may reduce
+    or accumulate the norm in fp32 while the parameters themselves stay bf16,
+    which is a real configuration rather than a contradiction.
     """
     notes = []
     for r in runs:
