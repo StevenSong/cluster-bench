@@ -37,29 +37,65 @@ zero1 0.198, tp2-zero2 0.367, hpz2 0.437, zero3 0.456, hpz4 0.466.
    same bytes as ZeRO-3 for a third of the time, and beats ZeRO-1/ZeRO-2, which
    communicate strictly less. The residual is DeepSpeed's stage-3 runtime.
    Whether it amortizes at 31B (an 8× longer step) is now the central question.
-   Corroborating, added 2026-08-15: `zero0` at 0.318 s exposed is *worse* than
-   ZeRO-1 (0.198) and ZeRO-2 (0.196) — inside DeepSpeed, turning ZeRO off costs
-   more than turning it on. Full ordering of exposed comm s/step at full/8192:
-   fsdp-full 0.154 · zero2 0.196 · zero1 0.198 · **zero0 0.318** ·
-   tp2-zero2 0.367 · hpz2 0.437 · zero3 0.456 · hpz4 0.466.
+   Corroborating: `zero0` at 0.318 s exposed is *worse* than ZeRO-1 (0.198) and
+   ZeRO-2 (0.196) — inside DeepSpeed, turning ZeRO off costs more than turning
+   it on. Full ordering of exposed comm s/step at full/8192: fsdp-full 0.165 ·
+   zero2 0.196 · zero1 0.198 · **zero0 0.318** · tp2-zero2 0.367 · hpz2 0.437 ·
+   zero3 0.456 · hpz4 0.466.
+
+   **But the gap is not a fixed cost, and it amortizes** (2C, 2026-08-15).
+   `zero3 − fsdp-full` across the token sweep is 0.320 · 0.297 · 0.291 ·
+   **0.094 · 0.036** — flat below the knee, then collapsing to 1.2% of the step
+   at 32768 tok/GPU. DeepSpeed's excess hides behind compute exactly the way
+   real comm does, so it is not Python overhead. That answers the question this
+   result opened: at 31B the step is ~8× longer at the same tokens/GPU, well
+   past the knee, and the two backends should converge. **The backend choice is
+   therefore low-stakes at the 31B operating point** — spend that budget on
+   memory and on confirming the ranking, not on a bake-off.
 2. **hpZ is dead.** hpz2 is slower than flat ZeRO-3 in *every* cell of 2A, 2B
    and 2C; hpz4 too. Not a config that failed to engage — memory is +3.2/+1.6 GB,
    exactly the secondary-partition arithmetic. It follows from (1): hpZ
    optimizes the param gather, and the gather is not the cost. Do not take hpZ
    to 31B; +3.2 GB at 4B extrapolates to **+25 GB/GPU at 31B**.
 3. **Cross-pair PCIe is worse than the network** — the question driving the
-   whole repo. Read it off the DDP rows, which are a clean link probe (one
-   allreduce, same volume). 2 GPUs: NVLink 0.9097 < RoCE 0.9293 < **PCIe
-   0.9759**. within-pair vs across-pairs is perfectly controlled (same node,
-   same ranks) and the PCIe hop costs 7.3%. 4 GPUs: pair-per-node 0.9581 beats
-   one-node 1.0123 by 5.7%. Same direction in the ZeRO-3 rows.
-4. **2C crossover: between 8192 and 16384 tok/GPU/step.** Exposed comm is flat
-   at ~0.44 s/step from 2048 to 8192 (comm bytes don't depend on batch size),
-   then collapses to 0.195 at 16384 and 0.094 at 32768. Portable form: *this
-   cluster exposes ~0.45 s/step of un-hidden ZeRO-3 traffic for a 4B model, and
-   it stops mattering once compute per step exceeds ~1.5–2 s.* Trust 8192 and
-   up — DDP goes 0.7236 → 0.7690 s for 2× the tokens at the bottom of the
-   range, so those points measure fixed cost against fixed cost.
+   whole repo. **Read it off the `fsdp-full` rows** (revised 2026-08-15; the
+   DDP rows were the earlier answer and no longer carry it — see the noise
+   floor below). Normalised exposed comm by (N−1)/N: NVLink 0.118 < RoCE 0.304
+   < **PCIe 0.355**, the full three-tier hierarchy, and the 4-GPU pair
+   separates cleanly — **pair-per-node 0.200 vs one-node 0.261**, 30% more
+   exposed comm once PCIe is in the path. Through `zero3` those two are 0.485
+   and 0.489, indistinguishable: ZeRO-3 cannot see placement at 4 GPUs at all.
+   The 2-GPU ZeRO-3 anomaly is also absent under FSDP2 (within-pair goes from
+   worst per byte, 0.856, to best, 0.118), which settles result 6 — it was
+   DeepSpeed, not the cluster.
+
+   **Noise floor, measured 2026-08-15** from the `__profile` DDP repeats
+   (`wall_clock_breakdown` does not touch the DDP path, so they are clean
+   repeats): across-nodes 0.9293/0.9291 = **0.02%**, across-pairs
+   0.9759/0.9521 = **2.5%**, within-pair 0.9097/0.9555 = **5.0%**. The 2-GPU
+   same-node cells are noisy and the cross-node one is not. This retires the
+   old DDP three-tier claim: means are NVLink 0.9326, RoCE 0.9292, PCIe 0.9640,
+   so NVLink and RoCE are **not** separable at 2 GPUs and only PCIe-is-worst
+   survives. Any future single-cell comparison at these placements needs a
+   repeat before it means anything.
+4. **2C crossover: between 8192 and 16384 tok/GPU/step, and the location is a
+   property of the cluster, not of DeepSpeed** (confirmed with `fsdp-full`,
+   2026-08-15). Exposed comm s/step:
+
+   | tok/GPU | zero3 | fsdp-full | ratio |
+   |---|---|---|---|
+   | 2048 | 0.444 | 0.124 | 3.6× |
+   | 4096 | 0.410 | 0.113 | 3.6× |
+   | 8192 | 0.456 | 0.165 | 2.8× |
+   | 16384 | 0.195 | 0.101 | 1.9× |
+   | 32768 | 0.094 | 0.058 | 1.6× |
+
+   Both backends knee in the same place. So the durable claim is *the knee sits
+   between 8192 and 16384 tok/GPU/step on this cluster* — the **magnitude** is
+   backend-specific (0.45 s/step is DeepSpeed's number; FSDP2's is ~0.12–0.17)
+   and does not transfer. Trust 8192 and up — DDP goes 0.7236 → 0.7690 s for 2×
+   the tokens at the bottom of the range, so those points measure fixed cost
+   against fixed cost.
 5. **TP=2 costs ~0.17 s/step** even entirely on NVLink (0.367 against zero2's
    0.196), as predicted: TP all-reduces are synchronous and unhideable.
 6. **The 2-GPU same-node ZeRO-3 cells are not a fabric effect.** Exposed comm
@@ -169,16 +205,21 @@ is the only bf16-in-place cell — bf16 params, grads and Adam moments, updated 
 place — so it is both what every overhead number is divided by and the one cell
 no reference loss curve can gate. DeepSpeed stage 0 has DDP's wire profile with
 fp32 master weights, which would have fixed both. Measured: **1.316 s p50,
-slower than ZeRO-1's 1.196 despite sharding less.** With `bf16.enabled` and ZeRO
-off, deepspeed builds a `BF16_Optimizer` that all-reduces the whole gradient
-(2P) *and* all-gathers the updated bf16 params (P); ZeRO-1 reduce-scatters and
-all-gathers, 2P total, the same as DDP's allreduce. ~3P vs ~2P, and the measured
-1.6× on exposed comm matches the 1.5× on volume. Stage 0 is the most expensive
-non-stage-3 path DeepSpeed has.
+slower than ZeRO-1's 1.196 despite sharding less.** Not a volume difference:
+peak memory came back at **75.0 GB** — 8 bf16 params + 8 bf16 grads + 16 fp32
+master + 32 fp32 Adam + activations — so stage 0 holds *full, unpartitioned*
+optimizer state on every rank and gathers nothing. Its gradient all-reduce is
+DDP's 2P exactly. What it lacks is **overlap**: DeepSpeed reduces at the end of
+backward, where torch DDP fires bucketed all-reduces from gradient hooks during
+it, and DeepSpeed's own stages 1–3 overlap via their reduction hooks. Same bytes
+as DDP, none of them hidden.
 
-It also misses the reference loss curve by **0.1831** (family spread:
-0.006–0.022), unexplained as of 2026-08-15, which makes its timing untrustworthy
-too. **The denominator is still DDP and is still ungated — that hole is open.**
+It also misses the reference loss curve by 0.1831 — but **mean +0.0026,
+straddling**, and `check_grad_norm_scale` finds no spread, so gradients are the
+same size and the trajectory is the same; the per-step logged values wobble.
+A reporting/normalization artifact, not a sharding bug, and not worth chasing
+now that the row is dead. **The denominator is still DDP and is still ungated —
+that hole is open.**
 Row kept in 2A as evidence; `report.check_baseline_candidates` re-derives the
 verdict every report, worth re-reading after the 0.19.4 upgrade.
 

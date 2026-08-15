@@ -89,7 +89,23 @@ def load(runs_dir: Path) -> list[dict[str, Any]]:
 
 
 def _group_key(r: dict[str, Any]) -> tuple:
-    return (r["placement"]["name"], r["tokens_per_gpu_step"], r["spec"]["seq_len"])
+    """What makes two cells comparable to each other.
+
+    `tag` is part of it, and has to be: a tagged re-run is a *different run
+    condition*, not a second sample of the same one. The profiling matrix
+    (tag=profile) reruns ddp and zero3 at three placements with
+    wall_clock_breakdown on, which instruments the DeepSpeed cells and not the
+    DDP ones -- so mixing the two sets means a profiled DDP cell can become the
+    denominator for an unprofiled ZeRO-3 one, and the overhead column silently
+    compares across run conditions. Without this the baseline is also just
+    whichever same-named run sorted last, which is not a decision anyone made.
+    """
+    return (
+        r["placement"]["name"],
+        r["tokens_per_gpu_step"],
+        r["spec"]["seq_len"],
+        r["spec"].get("tag", ""),
+    )
 
 
 def _data_key(r: dict[str, Any]) -> tuple:
@@ -191,14 +207,17 @@ def check_baseline_candidates(runs: list[dict[str, Any]]) -> list[str]:
             )
         elif zero1 and zero0 / zero1 - 1 > BASELINE_LIKE_FOR_LIKE_TOL:
             line += (
-                " -- slower than zero1, which shards strictly more. Stage 0 is "
-                "not a lighter ZeRO-1, it is a heavier one: DeepSpeed's "
-                "BF16_Optimizer all-reduces the whole gradient (2P) and then "
-                "all-gathers the updated bf16 params (P), where ZeRO-1 "
-                "reduce-scatters and all-gathers (2P total, the same as DDP's "
-                "allreduce). ~3P against ~2P, so stage 0 is the most expensive "
-                "non-stage-3 path DeepSpeed has. It cannot be the "
-                "zero-param-comm ceiling; keep --baseline ddp."
+                " -- slower than zero1, which shards strictly more. The volume "
+                "is not the difference: check peak memory, and if stage 0 is "
+                "holding full unpartitioned fp32 master weights and Adam state "
+                "(~16 bytes/param on every rank) then nothing is being "
+                "gathered and its gradient all-reduce is DDP's 2P exactly. "
+                "What stage 0 lacks is overlap -- DeepSpeed reduces at the end "
+                "of backward, where torch DDP fires bucketed all-reduces from "
+                "gradient hooks during it, and DeepSpeed's own stages 1-3 "
+                "overlap via their reduction hooks. Same bytes as DDP, none of "
+                "them hidden. Not a zero-param-comm ceiling in wall-clock "
+                "terms; keep --baseline ddp."
             )
         elif zero1 and abs(zero0 - zero1) < abs(zero0 - ddp):
             line += (
@@ -270,10 +289,7 @@ def check_token_control(runs: list[dict[str, Any]]) -> list[str]:
                 "produce exact chunks -- this cell is not comparable to the rest."
             )
 
-    measured = {
-        (r["placement"]["name"], r["tokens_per_gpu_step"], r["spec"]["seq_len"]): []
-        for r in runs
-    }
+    measured: dict[tuple, list[float]] = {_group_key(r): [] for r in runs}
     for r in runs:
         if r.get("tokens_per_gpu_step_measured") is not None:
             measured[_group_key(r)].append(r["tokens_per_gpu_step_measured"])
@@ -462,11 +478,11 @@ def check_grad_norm_scale(runs: list[dict[str, Any]]) -> list[str]:
         )
         if len(norms) < 5:
             continue
-        key = (*_group_key(r), _precision_class(r), r["strategy"].get("tp_size", 1))
+        key = (_group_key(r), _precision_class(r), r["strategy"].get("tp_size", 1))
         buckets.setdefault(key, {})[r["strategy"]["name"]] = norms[len(norms) // 2]
 
     notes = []
-    for key, cells in sorted(buckets.items()):
+    for (group, precision, _tp), cells in sorted(buckets.items()):
         if len(cells) < 2:
             continue
         lo_name, lo = min(cells.items(), key=lambda kv: kv[1])
@@ -474,15 +490,11 @@ def check_grad_norm_scale(runs: list[dict[str, Any]]) -> list[str]:
         if hi / lo <= GRAD_NORM_SPREAD_TOL:
             continue
         world = next(
-            (
-                r["placement"]["world_size"]
-                for r in runs
-                if _group_key(r) == key[:3]
-            ),
+            (r["placement"]["world_size"] for r in runs if _group_key(r) == group),
             None,
         )
         line = (
-            f"{key[0]}/t{key[1]} ({key[3]}): median grad norm spans "
+            f"{group[0]}/t{group[1]} ({precision}): median grad norm spans "
             f"{hi / lo:.1f}x across cells that should agree -- "
             f"{hi_name} {hi:.3g} vs {lo_name} {lo:.3g}"
         )
@@ -514,18 +526,22 @@ def table(runs: Iterable[dict[str, Any]]) -> str:
         key=lambda r: (
             r["placement"]["name"],
             r["tokens_per_gpu_step"],
+            r["spec"].get("tag", ""),
             r.get("_comm_overhead") if r.get("_comm_overhead") is not None else -1,
         ),
     )
     head = (
-        f"{'strategy':<14} {'placement':<14} {'tok/gpu':>8} {'p50 s':>8} "
-        f"{'p95 s':>8} {'p95/p50':>8} {'tok/s/gpu':>10} {'peak GB':>8} "
-        f"{'overhead':>9} {'vs':>7}"
+        f"{'strategy':<14} {'placement':<14} {'tag':<8} {'tok/gpu':>8} "
+        f"{'p50 s':>8} {'p95 s':>8} {'p95/p50':>8} {'tok/s/gpu':>10} "
+        f"{'peak GB':>8} {'overhead':>9} {'vs':>7}"
     )
     lines = [head, "-" * len(head)]
     for r in rows:
         lines.append(
             f"{r['strategy']['name']:<14} {r['placement']['name']:<14} "
+            # Without this two rows of the same (strategy, placement) are
+            # indistinguishable, and a tagged re-run reads as a duplicate.
+            f"{r['spec'].get('tag', '') or '-':<8} "
             f"{r['tokens_per_gpu_step']:>8} "
             f"{_fmt(r.get('step_time_p50_s'), '.4f'):>8} "
             f"{_fmt(r.get('step_time_p95_s'), '.4f'):>8} "
