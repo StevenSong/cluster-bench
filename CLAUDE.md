@@ -30,23 +30,28 @@ README.md carries the full operating manual. This file is the standing plan.
 
 ## Results of the first pass (2026-08-15) — read this before planning runs
 Convert overhead back to **exposed comm seconds/step** (p50 minus matched DDP
-p50); the ratio hides the finding. At full/8192: fsdp-full 0.154, zero2 0.196,
-zero1 0.198, tp2-zero2 0.367, hpz2 0.437, zero3 0.456, hpz4 0.466.
+p50); the ratio hides the finding. At full/8192: fsdp-full 0.166, zero2 0.195,
+zero1 0.197, zero0 0.318, tp2-zero2 0.366, zero3 0.403, hpz2 0.436, hpz4 0.465.
+All figures below are recomputed from the JSONs currently in `results/runs/`,
+against the ddp replicate mean of 0.9987 — *except* the DeepSpeed phase
+breakdown in result 6, which `wall_clock_breakdown` prints to rank 0's stdout
+and no JSON captures. Those five numbers live only in this file and in a tee'd
+log; treat them accordingly.
 
-1. **60% of flat ZeRO-3's cost is not the fabric** — 59.7% ± 2.4%, from n=6
-   replicates each at full/8192 (result 8). Exposed comm: fsdp-full
-   **0.1659 ± 0.0056** s/step, zero3 **0.4118 ± 0.0201**, ratio **2.48 ± 0.15**.
-   FSDP2 FULL_SHARD moves the same bytes as ZeRO-3 for 40% of the exposed time,
+1. **~59% of flat ZeRO-3's cost is not the fabric** — 58.8% ± 3.1%, from
+   replicates at full/8192 (result 8). Exposed comm: fsdp-full
+   **0.166 ± 0.008** s/step, zero3 **0.403 ± 0.023**, ratio **2.43 ± 0.18**.
+   FSDP2 FULL_SHARD moves the same bytes as ZeRO-3 for 41% of the exposed time,
    and beats ZeRO-1/ZeRO-2, which communicate strictly less. The residual is
    DeepSpeed's stage-3 runtime.
-   Corroborating: `zero0` at 0.318 s exposed is *worse* than ZeRO-1 (0.198) and
-   ZeRO-2 (0.196) — inside DeepSpeed, turning ZeRO off costs more than turning
-   it on. Full ordering of exposed comm s/step at full/8192: fsdp-full 0.165 ·
-   zero2 0.196 · zero1 0.198 · **zero0 0.318** · tp2-zero2 0.367 · hpz2 0.437 ·
-   zero3 0.456 · hpz4 0.466.
+   Corroborating: `zero0` at 0.318 s exposed is *worse* than ZeRO-1 (0.197) and
+   ZeRO-2 (0.195) — inside DeepSpeed, turning ZeRO off costs more than turning
+   it on. Full ordering of exposed comm s/step at full/8192: fsdp-full 0.166 ·
+   zero2 0.195 · zero1 0.197 · **zero0 0.318** · tp2-zero2 0.366 · zero3 0.403 ·
+   hpz2 0.436 · hpz4 0.465.
 
    **But the gap is not a fixed cost, and it amortizes** (2C, 2026-08-15).
-   `zero3 − fsdp-full` across the token sweep is 0.320 · 0.297 · 0.291 ·
+   `zero3 − fsdp-full` across the token sweep is 0.320 · 0.298 · 0.237 ·
    **0.094 · 0.036** — flat below the knee, then collapsing to 1.2% of the step
    at 32768 tok/GPU. DeepSpeed's excess hides behind compute exactly the way
    real comm does, so it is not Python overhead. That answers the question this
@@ -68,13 +73,13 @@ zero1 0.198, tp2-zero2 0.367, hpz2 0.437, zero3 0.456, hpz4 0.466.
 3. **Cross-pair PCIe is worse than the network** — the question driving the
    whole repo. **Read it off the `fsdp-full` rows** (revised 2026-08-15; the
    DDP rows were the earlier answer and no longer carry it — see the noise
-   floor below). Normalised exposed comm by (N−1)/N: NVLink 0.118 < RoCE 0.304
-   < **PCIe 0.355**, the full three-tier hierarchy, and the 4-GPU pair
+   floor below). Normalised exposed comm by (N−1)/N: NVLink 0.072 < RoCE 0.304
+   < **PCIe 0.379**, the full three-tier hierarchy, and the 4-GPU pair
    separates cleanly — **pair-per-node 0.200 vs one-node 0.261**, 30% more
    exposed comm once PCIe is in the path. Through `zero3` those two are 0.485
    and 0.489, indistinguishable: ZeRO-3 cannot see placement at 4 GPUs at all.
    The 2-GPU ZeRO-3 anomaly is also absent under FSDP2 (within-pair goes from
-   worst per byte, 0.856, to best, 0.118), which settles result 6 — it was
+   worst per byte, 0.790, to best, 0.072), which settles result 6 — it was
    DeepSpeed, not the cluster.
 
    **Noise floor, measured 2026-08-15** from the `__profile` DDP repeats
@@ -94,21 +99,21 @@ zero1 0.198, tp2-zero2 0.367, hpz2 0.437, zero3 0.456, hpz4 0.466.
    |---|---|---|---|
    | 2048 | 0.444 | 0.124 | 3.6× |
    | 4096 | 0.410 | 0.113 | 3.6× |
-   | 8192 | 0.456 | 0.165 | 2.8× |
+   | 8192 | 0.403 | 0.166 | 2.4× |
    | 16384 | 0.195 | 0.101 | 1.9× |
    | 32768 | 0.094 | 0.058 | 1.6× |
 
    Both backends knee in the same place. So the durable claim is *the knee sits
    between 8192 and 16384 tok/GPU/step on this cluster* — the **magnitude** is
-   backend-specific (0.45 s/step is DeepSpeed's number; FSDP2's is ~0.12–0.17)
+   backend-specific (~0.40–0.44 s/step is DeepSpeed's number; FSDP2's is ~0.11–0.17)
    and does not transfer. Trust 8192 and up — DDP goes 0.7236 → 0.7690 s for 2×
    the tokens at the bottom of the range, so those points measure fixed cost
    against fixed cost.
-5. **TP=2 costs ~0.17 s/step** even entirely on NVLink (0.367 against zero2's
-   0.196), as predicted: TP all-reduces are synchronous and unhideable.
+5. **TP=2 costs ~0.17 s/step** even entirely on NVLink (0.366 against zero2's
+   0.195), as predicted: TP all-reduces are synchronous and unhideable.
 6. **The 2-GPU same-node ZeRO-3 cells are not a fabric effect.** Exposed comm
-   normalised by the (N−1)/N gather factor is 0.48–0.52 everywhere except
-   across-pairs (0.71) and within-pair (0.86) — the fastest link, worst per
+   normalised by the (N−1)/N gather factor is 0.46–0.49 everywhere except
+   across-pairs (0.680) and within-pair (0.790) — the fastest link, worst per
    byte. Profiled 2026-08-15 (`2b_anomaly_profile.yaml`): **every DeepSpeed
    timer is placement-flat within 2.7%, and within-pair is fastest in all of
    them.** `bwd_allreduce` is 5–16 ms, ~1% of the step. The entire difference
@@ -117,6 +122,12 @@ zero1 0.198, tp2-zero2 0.367, hpz2 0.437, zero3 0.456, hpz4 0.466.
    all-reduce, and the end-of-step `cuda.synchronize()` that drains whatever
    `overlap_comm` left in flight. DeepSpeed's timers bound the CPU-side enqueue
    window only, so they cannot separate late-completing comm from host work.
+   **Real, not a sampling artifact** — each 2-GPU cell now has n=2, and on
+   means the normalised exposed comm is within-pair 0.790 ± 0.050, across-pairs
+   0.680, across-nodes 0.488 ± 0.008. Roughly 6σ apart, and `fsdp-full` at the
+   same placements inverts it (0.072 on NVLink, the cheapest cell). So it is a
+   genuine DeepSpeed stage-3 effect that only appears when ranks share a node.
+
    **Closed as not worth chasing, 2026-08-15.** No conclusion depends on it:
    result 3 rests on the DDP rows (which show no anomaly) and the 4-GPU pair
    (also clean), 2-GPU placements are diagnostic-only, and full/8192 normalizes
@@ -128,10 +139,13 @@ zero1 0.198, tp2-zero2 0.367, hpz2 0.437, zero3 0.456, hpz4 0.466.
    that the per-step barrier exposes ZeRO-3's async comm disproportionately,
    since DeepSpeed accounts for only 82–93% of the step and has more in flight
    at a step boundary than DDP. Measured with `--no-sync-each-step --tag
-   nosync` at full/8192: exposed comm went 0.1650 → 0.1702 for fsdp-full and
-   0.4561 → 0.4615 for zero3 — both slightly *up*, neither materially changed.
-   The barrier is not inflating either backend and is not the source of the
-   backend gap. Every number stands on this count.
+   nosync` at full/8192, against the mean of the sync replicates: exposed comm
+   went 0.160 → 0.170 for fsdp-full and 0.383 → 0.462 for zero3. Both moved
+   **up**, which is the opposite of the hypothesis — removing the barrier was
+   supposed to *reduce* exposed comm, most for ZeRO-3. And with one nosync
+   sample against zero3's sd of 0.049 (result 8), the zero3 move is ~1.2σ:
+   not significant either. The barrier is not inflating either backend and is
+   not the source of the backend gap. Every number stands on this count.
 
 8. **Run-to-run variance is backend-specific; ZeRO-3's is ~4× FSDP2's.**
    Replicated at full/8192, n=6 each (`report.summarize_replicates` prints this
@@ -139,12 +153,23 @@ zero1 0.198, tp2-zero2 0.367, hpz2 0.437, zero3 0.456, hpz4 0.466.
 
    | | n | mean | sd | cv | range |
    |---|---|---|---|---|---|
-   | ddp | 3 | 0.9984 | 0.0064 | 0.64% | 1.3% |
-   | fsdp-full | 6 | 1.1643 | 0.0101 | **0.87%** | 2.3% |
-   | zero3 | 6 | 1.4102 | 0.0485 | **3.44%** | 8.6% |
+   | ddp | 2 | 0.9987 | 0.0090 | 0.9% | 1.3% |
+   | fsdp-full | 5 | 1.1647 | 0.0113 | **1.0%** | 2.3% |
+   | zero3 | 5 | 1.4015 | 0.0487 | **3.5%** | 8.6% |
 
-   Unimodal, broad — no bimodality (sorted: 1.3386 · 1.3689 · 1.4031 · 1.4429 ·
-   1.4538 · 1.4539; the two matching to four decimals are coincidence).
+   (On-disk n, matching what `report.py` prints. The clobbered originals —
+   ddp 0.9978, fsdp-full 1.1628, zero3 1.4539 — are consistent with these and
+   move nothing: including them gives 59.7% ± 2.4% against 58.8% ± 3.1%.)
+
+   **Reproducibility is also placement-dependent, and `across-nodes` is the
+   most stable placement for both backends** — ddp cv 0.0% (0.9293/0.9291),
+   zero3 cv 0.5%. Everything that co-locates ranks on one node is noisier:
+   ddp within-pair cv 3.5% / range 5.0%, across-pairs 1.7%/2.5%. Same grouping
+   as result 6's anomaly, now visible as variance rather than as a mean shift.
+
+   Unimodal, broad — no bimodality (sorted, on disk: 1.3386 · 1.3689 · 1.4031 ·
+   1.4429 · 1.4538; the clobbered original was 1.4539, and its matching the
+   nosync run to four decimals was coincidence, not structure).
    Tails differ the same way: p95/p50 is 1.42–1.78 for zero3 against 1.09–1.23
    for fsdp-full, so FSDP2's tail is both lower and steadier.
 

@@ -20,18 +20,22 @@ crossover.
 ## Findings — read this first
 
 **Yes, the cross-pair PCIe hop is worse than the network.** Measured through
-FSDP2 at 8192 tok/GPU/step, normalised exposed communication per GPU is 0.118
-on NVLink, 0.304 over RoCE, and **0.355 across the PCIe hop** — the full
+FSDP2 at 8192 tok/GPU/step, normalised exposed communication per GPU is 0.072
+on NVLink, 0.304 over RoCE, and **0.379 across the PCIe hop** — the full
 three-tier hierarchy, with PCIe last. The 4-GPU comparison is the clean one:
 `pair-per-node` (NVLink + RoCE, zero PCIe) costs 0.200 against `one-node`
 (NVLink + PCIe) at 0.261.
+
+Read this through `fsdp-full`, not through DDP or ZeRO-3. DDP's exposed comm is
+small enough that the 2-GPU placements' own run-to-run spread (up to 5%) swamps
+the NVLink-vs-RoCE difference, and ZeRO-3's spread is wider still.
 
 ### How to train on this node
 
 Default to **FSDP2 FULL_SHARD**, not DeepSpeed ZeRO-3: same bytes on the wire,
 but ~0.17 s/step of exposed communication instead of ~0.41 (17% over the
 measured DDP compute ceiling rather than 41%), plus a lower and steadier tail
-(p95/p50 1.15 vs 1.54), 4× better run-to-run reproducibility, and marginally
+(p95/p50 1.16 vs 1.55), 4× better run-to-run reproducibility, and marginally
 lower peak memory. Skip hpZ and skip tensor parallelism — hpZ costs +3.2 GB/GPU
 for a speedup indistinguishable from zero, and TP=2 adds ~0.17 s/step of
 synchronous, unhideable all-reduce even when confined entirely to NVLink. Then
@@ -49,23 +53,25 @@ zero-param-comm compute ceiling, not spec FLOPS.
 
 | config | p50 s | exposed comm s/step | overhead | peak GB |
 |---|---|---|---|---|
-| ddp (ceiling) | 0.9984 † | — | — | 38.6 |
-| **fsdp-full** | **1.1643** † | **0.166 ± 0.006** | **+16.6%** | **12.0** |
-| zero2 | 1.1942 | 0.196 | +19.6% | 17.7 |
+| ddp (ceiling) | 0.9987 † | — | — | 38.6 |
+| **fsdp-full** | **1.1647** † | **0.166 ± 0.008** | **+16.6%** | **12.0** |
+| zero2 | 1.1942 | 0.195 | +19.6% | 17.7 |
 | zero1 | 1.1955 | 0.197 | +19.7% | 17.7 |
 | zero0 | 1.3163 | 0.318 | +31.8% | 75.0 |
-| tp2-zero2 | 1.3652 | 0.367 | +36.7% | 16.4 |
-| zero3 | 1.4102 † | 0.412 ± 0.020 | +41.2% | 13.2 |
-| zero3-hpz2 | 1.4350 | 0.437 | +43.7% | 16.4 |
+| tp2-zero2 | 1.3652 | 0.366 | +36.7% | 16.4 |
+| zero3 | 1.4015 † | 0.403 ± 0.023 | +40.3% | 13.2 |
+| zero3-hpz2 | 1.4350 | 0.436 | +43.7% | 16.4 |
 | zero3-hpz4 | 1.4636 | 0.465 | +46.6% | 14.8 |
 
-† mean of replicates (n=3–6). The rest are single samples, and DeepSpeed cells
-carry a ~3.4% run-to-run spread, so margins under ~10% between them are not
-resolvable — see "Reading the results".
+† mean of replicates (n=2–5), as printed by `report.py`'s `replicates` section.
+The rest are single samples, and DeepSpeed cells carry a ~3.5% run-to-run
+spread, so margins under ~10% between them are not resolvable — `zero3`,
+`tp2-zero2`, `zero3-hpz2` and `zero3-hpz4` are one indistinguishable cluster.
+`fsdp-full` (~1.0%) and `ddp` (~0.9%) are stable enough to compare directly.
 
-**59.7% ± 2.4% of ZeRO-3's exposed cost is not the fabric.** FSDP2 moves
-identical bytes for 40% of the time, and beats ZeRO-1/ZeRO-2, which communicate
-strictly less. It amortizes, though: `zero3 − fsdp-full` falls from ~0.30 s at
+**58.8% ± 3.1% of ZeRO-3's exposed cost is not the fabric.** FSDP2 moves
+identical bytes for 41% of the time, and beats ZeRO-1/ZeRO-2, which communicate
+strictly less. It amortizes, though: `zero3 − fsdp-full` falls from ~0.24 s at
 8192 tok/GPU to 0.036 s at 32768, so at a 31B-sized step the backends should
 converge and the choice matters less than it does here.
 
