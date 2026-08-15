@@ -30,13 +30,14 @@ placements: [full]
 
 strategies:
   - ddp                   # compute ceiling / denominator
-  # DeepSpeed with ZeRO off: same wire profile as ddp, but fp32 master weights,
-  # so it is in the same numerical family as every cell it would be the
-  # denominator for -- and therefore gate-able, which ddp is not. Whether it is
-  # really zero-param-comm is decided by report.check_baseline_candidates, not
-  # by the label: deepspeed's BF16_Optimizer may be partitioning the master
-  # weights and all-gathering params behind stage 0. If it is, this row is
-  # DeepSpeed's fixed runtime floor instead, which 2A wants anyway.
+  # DeepSpeed with ZeRO off, added as a candidate replacement denominator and
+  # REJECTED on measurement (2026-08-15): 1.316 s p50, slower than zero1's
+  # 1.196 despite sharding less, because stage-0's BF16_Optimizer all-reduces
+  # gradients *and* all-gathers params (~3P vs ZeRO-1's ~2P). It also missed
+  # the reference loss curve by 0.1831. Kept as the standing evidence that the
+  # denominator cannot be repaired this way -- check_baseline_candidates
+  # re-derives the verdict on every report, which is what makes it worth the
+  # ~4 minutes after a DeepSpeed upgrade.
   - zero0
   - zero1
   - zero2

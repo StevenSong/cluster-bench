@@ -37,6 +37,11 @@ zero1 0.198, tp2-zero2 0.367, hpz2 0.437, zero3 0.456, hpz4 0.466.
    same bytes as ZeRO-3 for a third of the time, and beats ZeRO-1/ZeRO-2, which
    communicate strictly less. The residual is DeepSpeed's stage-3 runtime.
    Whether it amortizes at 31B (an 8× longer step) is now the central question.
+   Corroborating, added 2026-08-15: `zero0` at 0.318 s exposed is *worse* than
+   ZeRO-1 (0.198) and ZeRO-2 (0.196) — inside DeepSpeed, turning ZeRO off costs
+   more than turning it on. Full ordering of exposed comm s/step at full/8192:
+   fsdp-full 0.154 · zero2 0.196 · zero1 0.198 · **zero0 0.318** ·
+   tp2-zero2 0.367 · hpz2 0.437 · zero3 0.456 · hpz4 0.466.
 2. **hpZ is dead.** hpz2 is slower than flat ZeRO-3 in *every* cell of 2A, 2B
    and 2C; hpz4 too. Not a config that failed to engage — memory is +3.2/+1.6 GB,
    exactly the secondary-partition arithmetic. It follows from (1): hpZ
@@ -134,18 +139,23 @@ spelling (`fsdp_sharding_strategy: HYBRID_SHARD`) and verification **by peak
 memory rising**, not by the key being in the config. Low priority: its job was
 cross-checking hpZ, and hpZ is dead (below).
 
-**Row 2 added 2026-08-15** to repair the denominator. DDP is the only
-bf16-in-place cell — it holds bf16 params, grads and Adam moments — so it is
-both the denominator and the one cell no reference loss curve can gate.
-DeepSpeed stage 0 has DDP's wire profile with fp32 master weights, which would
-fix both. **But it may not be zero-param-comm**: with `bf16.enabled` and ZeRO
-off, deepspeed builds a `BF16_Optimizer` that partitions the fp32 master
-weights across the DP group and all-gathers the updated bf16 params every step
-— ZeRO-1's pattern under a stage-0 label, with no flag to disable it. Do not
-assume either way; `report.check_baseline_candidates` decides from the data.
-Within ~3% of DDP → switch to `--baseline zero0`. Level with ZeRO-1 → keep DDP
-and read the row as DeepSpeed's fixed per-step runtime floor, which is worth
-having on its own (see Results below).
+**Row 2 added 2026-08-15 to repair the denominator, and it did not work.** DDP
+is the only bf16-in-place cell — bf16 params, grads and Adam moments, updated in
+place — so it is both what every overhead number is divided by and the one cell
+no reference loss curve can gate. DeepSpeed stage 0 has DDP's wire profile with
+fp32 master weights, which would have fixed both. Measured: **1.316 s p50,
+slower than ZeRO-1's 1.196 despite sharding less.** With `bf16.enabled` and ZeRO
+off, deepspeed builds a `BF16_Optimizer` that all-reduces the whole gradient
+(2P) *and* all-gathers the updated bf16 params (P); ZeRO-1 reduce-scatters and
+all-gathers, 2P total, the same as DDP's allreduce. ~3P vs ~2P, and the measured
+1.6× on exposed comm matches the 1.5× on volume. Stage 0 is the most expensive
+non-stage-3 path DeepSpeed has.
+
+It also misses the reference loss curve by **0.1831** (family spread:
+0.006–0.022), unexplained as of 2026-08-15, which makes its timing untrustworthy
+too. **The denominator is still DDP and is still ungated — that hole is open.**
+Row kept in 2A as evidence; `report.check_baseline_candidates` re-derives the
+verdict every report, worth re-reading after the 0.19.4 upgrade.
 
 **Row 9 is ZeRO-2, not ZeRO-3** (changed 2026-08-14): deepspeed 0.19.2 asserts
 `zero_optimization_stage() <= 2` whenever autotp is on. It costs the row nothing —
@@ -280,10 +290,19 @@ of this has executed):
   peak memory moving, not by the config containing the flag.** hpZ passes that
   test (+3.2/+1.6 GB) and is trustworthy as a negative result; fsdp-hybrid
   never did.
-- **`zero0` is a stage-0 label over a possibly ZeRO-1-shaped runtime** — see
-  row 2 above. The one thing that must not happen is quietly adopting it as the
-  denominator without checking; `report.check_baseline_candidates` runs the
-  check automatically on every report.
+- **Why `zero0` misses the reference loss curve by 0.1831** — open as of
+  2026-08-15, and the reason row 2 measures nothing usable. Cheapest
+  discriminator first, and it needs no re-run: `report.check_grad_norm_scale`
+  compares median grad norms across the group from the JSONs already on disk.
+  A ratio near the world size means a reduction that sums where the trainer
+  already took a mean, and everything else is downstream of it. Norms agreeing
+  instead puts it in the update — `BF16_Optimizer`'s own step, clipping, or
+  master-weight handling — not in the gradient.
+- **The denominator hole is still open.** DDP remains the only bf16-in-place
+  cell and nothing gates it. The remaining routes: a second DDP cell at the
+  same step budget (also measures the run-to-run noise floor `--loss-tol`
+  should be set from), or torch DDP with fp32 params plus a bf16 gradient
+  compression hook to keep the allreduce volume honest. Neither is started.
 - ~~**DeepSpeed AutoTP** for row 9 — verify 0.19.2 supports it for training~~ —
   ANSWERED on-cluster 2026-08-14: 0.19.2 supports autotp for training at ZeRO
   stage ≤ 2 only, asserting on stage 3. Row 9 is now `tp2-zero2`; `ds_config`

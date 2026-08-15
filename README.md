@@ -235,19 +235,29 @@ stage-0 label, with no flag to disable it. Assuming otherwise would hide an
 all-gather inside the denominator and deflate every overhead number in the
 study, which is the same failure as the `fsdp-hybrid` row above.
 
-So `report.check_baseline_candidates` reads the answer off the runs, and both
-answers are worth having:
+So `report.check_baseline_candidates` reads the answer off the runs:
 
 | `zero0` lands | Meaning | What to do |
 |---|---|---|
-| within ~3% of `ddp` | stage 0 really is zero-param-comm | switch to `--baseline zero0`; the denominator comes under the gate |
-| level with `zero1` | `BF16_Optimizer` is partitioning and all-gathering | keep `--baseline ddp`; read the row as DeepSpeed's fixed per-step runtime floor |
+| within ~3% of `ddp` | stage 0 really is zero-param-comm | gate it, then switch to `--baseline zero0` |
+| level with `zero1` | `BF16_Optimizer` partitions and all-gathers | keep `--baseline ddp`; the row is DeepSpeed's per-step runtime floor |
+| **slower than `zero1`** | stage 0 is a *heavier* ZeRO-1 | keep `--baseline ddp`; the row measures nothing usable |
 
-The second reading is not a consolation prize. 2A puts roughly two thirds of
-flat ZeRO-3's exposed cost somewhere other than the fabric — `fsdp-full` moves
-the same bytes for 0.154 s/step against `zero3`'s 0.456 s, and beats `zero1` and
-`zero2`, which communicate strictly less — and `zero0 − ddp` measures that floor
-directly.
+**Measured 2026-08-15: the third one.** `zero0` came back at 1.316 s p50 against
+`ddp`'s 0.998 and `zero1`'s 1.196 — slower than the config that shards strictly
+more. `BF16_Optimizer` all-reduces the whole gradient (2P) and *then*
+all-gathers the updated bf16 parameters (P), where ZeRO-1 reduce-scatters and
+all-gathers for 2P total, the same volume as DDP's allreduce. ~3P against ~2P;
+the measured 1.6× on exposed comm matches the 1.5× on volume. DeepSpeed's stage
+0 is the most expensive non-stage-3 path it has.
+
+It fails the correctness gate too — 0.1831 above the `zero3` reference over 100
+steps, against a 0.006–0.022 spread across the rest of the fp32-master family —
+so its step time is not trustworthy either, and it is not a usable measurement
+of the runtime floor. **The denominator is still `ddp`, and it is still
+ungated.** The row stays in 2A as the standing evidence for that, and because
+the verdict is re-derived automatically on every report, which is worth having
+after a DeepSpeed upgrade.
 
 The `vs` column in the table names the denominator each row was divided by.
 Groups that did not run the requested baseline fall back to the next candidate

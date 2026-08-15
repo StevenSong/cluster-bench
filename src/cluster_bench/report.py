@@ -35,6 +35,12 @@ BASELINE_STRATEGIES = ("ddp", "zero0")
 # room for a per-step all-gather of every parameter.
 BASELINE_LIKE_FOR_LIKE_TOL = 0.03
 
+# How far median grad norms may spread across cells in the same comparison
+# group before it stops being run-to-run variation. Cells differing only in how
+# parameters are sharded see the same gradients; a reduction that sums where
+# the trainer already took a mean puts a factor of the world size between them.
+GRAD_NORM_SPREAD_TOL = 2.0
+
 # Backends whose optimizer keeps fp32 master weights. DeepSpeed's bf16 path
 # holds an fp32 partitioned copy of every parameter and applies the Adam update
 # in fp32; accelerate's FSDP2 path does the same. Plain DDP does not:
@@ -178,9 +184,21 @@ def check_baseline_candidates(runs: list[dict[str, Any]]) -> list[str]:
         if zero0 / ddp - 1 <= BASELINE_LIKE_FOR_LIKE_TOL:
             line += (
                 " -- stage 0 costs no param comm here, so zero0 is a valid "
-                "like-for-like denominator. Re-run with --baseline zero0: the "
-                "overhead numbers lose the bf16-optimizer bias and the "
-                "denominator comes under the correctness gate."
+                "like-for-like denominator *if it also passes the correctness "
+                "gate*: a cell that trains differently is not a denominator, "
+                "whatever its step time. Gate it first, then re-run with "
+                "--baseline zero0."
+            )
+        elif zero1 and zero0 / zero1 - 1 > BASELINE_LIKE_FOR_LIKE_TOL:
+            line += (
+                " -- slower than zero1, which shards strictly more. Stage 0 is "
+                "not a lighter ZeRO-1, it is a heavier one: DeepSpeed's "
+                "BF16_Optimizer all-reduces the whole gradient (2P) and then "
+                "all-gathers the updated bf16 params (P), where ZeRO-1 "
+                "reduce-scatters and all-gathers (2P total, the same as DDP's "
+                "allreduce). ~3P against ~2P, so stage 0 is the most expensive "
+                "non-stage-3 path DeepSpeed has. It cannot be the "
+                "zero-param-comm ceiling; keep --baseline ddp."
             )
         elif zero1 and abs(zero0 - zero1) < abs(zero0 - ddp):
             line += (
@@ -189,7 +207,7 @@ def check_baseline_candidates(runs: list[dict[str, Any]]) -> list[str]:
                 "updated params each step, so stage 0 is ZeRO-1-shaped and "
                 "cannot be the zero-param-comm ceiling. Keep --baseline ddp. "
                 "What this row does measure is DeepSpeed's fixed per-step "
-                "runtime floor, which is the useful half of the question."
+                "runtime floor."
             )
         else:
             line += (
@@ -344,11 +362,26 @@ def check_loss_curves(
             problems.append(f"{r['run_id']}: no overlapping logged steps with reference")
             continue
         gated += 1
-        worst = max(abs(curve[s] - ref_curve[s]) for s in shared)
+        diffs = [curve[s] - ref_curve[s] for s in shared]
+        worst = max(abs(d) for d in diffs)
         if worst > tol:
+            # Signed, not just the magnitude. A curve that sits uniformly above
+            # the reference is training more slowly -- an effective learning
+            # rate or gradient-scaling difference -- while one that straddles it
+            # is walking different data or diverging. The two want completely
+            # different investigations, and |max| cannot tell them apart.
+            mean = sum(diffs) / len(diffs)
+            side = (
+                "consistently above"
+                if min(diffs) > 0
+                else "consistently below"
+                if max(diffs) < 0
+                else "straddling"
+            )
             problems.append(
-                f"{r['run_id']}: max loss deviation {worst:.4f} over {len(shared)} "
-                f"steps exceeds tol {tol}"
+                f"{r['run_id']}: max loss deviation {worst:.4f} over "
+                f"{len(shared)} steps exceeds tol {tol} "
+                f"(mean {mean:+.4f}, {side} the reference)"
             )
 
     # The failure this whole gate exists to prevent is a gate that looks like it
@@ -402,6 +435,72 @@ def check_precision_class_evidence(runs: list[dict[str, Any]]) -> list[str]:
                 "no longer describes this run, and the correctness gate is "
                 "grouping cells by the wrong families."
             )
+    return notes
+
+
+def check_grad_norm_scale(runs: list[dict[str, Any]]) -> list[str]:
+    """Are two cells in the same group seeing gradients of the same size?
+
+    The gate says *that* a loss curve separated; this says whether the
+    gradients did, which is the difference between "the update is applied
+    differently" and "the gradient reaching the optimizer is a different
+    number". The usual cause of the second is a reduction that averages where
+    the trainer already averaged, or sums where it expected a mean -- so the
+    tell is a ratio near the world size (or its reciprocal), not a small drift.
+
+    Compared within (group, precision class, tp_size): bf16-in-place and
+    fp32-master cells compute the norm differently, and a TP group's norm is
+    taken over a duplicated batch. Medians, so a couple of early spikes during
+    warmup do not decide it.
+    """
+    buckets: dict[tuple, dict[str, float]] = {}
+    for r in runs:
+        norms = sorted(
+            p["grad_norm"]
+            for p in r.get("loss_curve", [])
+            if isinstance(p.get("grad_norm"), (int, float)) and p["grad_norm"] > 0
+        )
+        if len(norms) < 5:
+            continue
+        key = (*_group_key(r), _precision_class(r), r["strategy"].get("tp_size", 1))
+        buckets.setdefault(key, {})[r["strategy"]["name"]] = norms[len(norms) // 2]
+
+    notes = []
+    for key, cells in sorted(buckets.items()):
+        if len(cells) < 2:
+            continue
+        lo_name, lo = min(cells.items(), key=lambda kv: kv[1])
+        hi_name, hi = max(cells.items(), key=lambda kv: kv[1])
+        if hi / lo <= GRAD_NORM_SPREAD_TOL:
+            continue
+        world = next(
+            (
+                r["placement"]["world_size"]
+                for r in runs
+                if _group_key(r) == key[:3]
+            ),
+            None,
+        )
+        line = (
+            f"{key[0]}/t{key[1]} ({key[3]}): median grad norm spans "
+            f"{hi / lo:.1f}x across cells that should agree -- "
+            f"{hi_name} {hi:.3g} vs {lo_name} {lo:.3g}"
+        )
+        if world and abs(hi / lo - world) / world < 0.2:
+            line += (
+                f". That ratio is the world size ({world}), which is what a "
+                "gradient reduction that sums where the trainer already took a "
+                "mean looks like -- not a numerics difference. Any loss-curve "
+                "deviation in this group is downstream of it, so fix this "
+                "first and re-gate."
+            )
+        else:
+            line += (
+                ". Gradients of different sizes reach the optimizer in these "
+                "cells, so a loss-curve difference between them is not "
+                "evidence about sharding."
+            )
+        notes.append(line)
     return notes
 
 
@@ -501,6 +600,7 @@ def main() -> None:
         ("baseline", check_baseline_candidates(runs)),
         ("plausibility", check_hpz_plausibility(runs)),
         ("optimizer precision", check_precision_class_evidence(runs)),
+        ("grad norm scale", check_grad_norm_scale(runs)),
         (
             "correctness gate",
             check_loss_curves(runs, args.reference, args.loss_tol)

@@ -84,30 +84,35 @@ STRATEGIES: dict[str, Strategy] = {
         name="zero0",
         backend="deepspeed",
         zero_stage=0,
-        purpose="like-for-like fp32-master denominator candidate",
+        purpose="denominator candidate -- MEASURED AND REJECTED, kept as evidence",
         param_gather="none",
         grad_reduce="global",
         notes=(
-            "Same wire profile as ddp on paper -- no sharding, bf16 gradient "
-            "reduction -- but run through DeepSpeed, so it keeps fp32 master "
-            "weights and lands in the same numerical family as every cell it "
-            "would be the denominator for. That makes it gate-able, which ddp "
-            "is not.",
-            "Whether it is actually a zero-param-comm ceiling is the open "
-            "question this row exists to answer, and it is not obvious: with "
-            "`bf16.enabled` and no ZeRO, deepspeed's engine builds a "
-            "BF16_Optimizer, which partitions the fp32 master weights over the "
-            "DP group and all-gathers the updated bf16 params at the end of "
-            "every step. That is ZeRO-1's comm pattern, not DDP's, and no "
-            "config flag disables it.",
-            "So read the measurement, do not assume the label. Within a few "
-            "percent of ddp: a valid like-for-like denominator, and the gate "
-            "hole closes (report --baseline zero0). Level with zero1 instead: "
-            "stage 0 is ZeRO-1-shaped, ddp stays the denominator, and this row "
-            "is measuring DeepSpeed's fixed per-step runtime floor -- which is "
-            "worth having either way, since 2A puts two thirds of flat ZeRO-3's "
-            "cost somewhere other than the fabric. "
-            "report.check_baseline_candidates decides this automatically.",
+            "Added to repair the denominator: ddp is the only bf16-in-place "
+            "cell in the matrix, so it is both what every overhead number is "
+            "divided by and the one cell no reference loss curve can gate. "
+            "Stage 0 has ddp's wire profile on paper, with fp32 master weights, "
+            "which would have fixed both.",
+            "MEASURED 2026-08-15, and the answer is no, on two independent "
+            "grounds. Timing: 1.316 s p50 against ddp's 0.998 and zero1's "
+            "1.196 -- stage 0 is *slower* than ZeRO-1, which shards strictly "
+            "more. DeepSpeed's BF16_Optimizer all-reduces the whole gradient "
+            "(2P) and then all-gathers the updated bf16 params (P); ZeRO-1 "
+            "reduce-scatters and all-gathers, 2P total, the same as DDP's "
+            "allreduce. ~3P against ~2P, and the measured ratio (1.6x on "
+            "exposed comm) matches the volume ratio (1.5x). Stage 0 is the "
+            "most expensive non-stage-3 path DeepSpeed has, not the cheapest.",
+            "Correctness: it also fails the gate, 0.1831 above the zero3 "
+            "reference over 100 steps, against a 0.006-0.022 spread across the "
+            "rest of the fp32-master family. Unexplained as of 2026-08-15 -- "
+            "report.check_grad_norm_scale discriminates gradient scaling from "
+            "an update-side difference. Until it is explained the timing above "
+            "is not trustworthy either, so this row measures nothing usable.",
+            "Kept in 2A anyway, at ~4 minutes a pass: it is the empirical "
+            "anchor for 'the denominator cannot be repaired this way', and "
+            "report.check_baseline_candidates re-derives that automatically. "
+            "Worth re-reading after a DeepSpeed upgrade -- the 0.19.4 bump "
+            "that would unblock TP at stage 3 is the obvious occasion.",
         ),
     ),
     "zero1": Strategy(

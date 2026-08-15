@@ -42,11 +42,13 @@ placements: [full]
 
 strategies:
   - ddp
-  # The cell that exists to close the hole described above: fp32 master weights
-  # like the rest of the DeepSpeed family, but no sharding, so if it is also a
-  # zero-param-comm ceiling it can replace ddp as the denominator and the
-  # denominator stops being ungated. report.check_baseline_candidates decides.
-  - zero0
+  # `zero0` was added here to close the hole described above -- fp32 master
+  # weights, no sharding, so it could have replaced ddp as a denominator that
+  # the gate covers. It was measured on 2026-08-15 and rejected: slower than
+  # zero1 (DeepSpeed's stage-0 BF16_Optimizer all-reduces gradients *and*
+  # all-gathers params, ~3P against ZeRO-1's ~2P), and 0.1831 off the reference
+  # loss curve against a 0.006-0.022 family spread. It stays in 2A as evidence;
+  # there is no reason to spend a gate cell on it. The hole is still open.
   - zero3
   - zero3-hpz4
   - zero3-hpz2
