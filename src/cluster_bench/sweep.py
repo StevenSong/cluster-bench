@@ -405,6 +405,13 @@ def main() -> None:
     ap.add_argument("--only", nargs="*", default=None,
                     help="run only these strategies/placements (exact names), "
                          "or cells whose run_id contains the given text")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="replace cells that already have a results JSON. "
+                         "Without it the sweep refuses to start when any cell "
+                         "would be overwritten -- run_id does not encode most "
+                         "spec fields, so a re-run with a different setting "
+                         "silently destroys the original, and results/runs/ is "
+                         "gitignored. Prefer --tag, which keeps both")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--list", action="store_true", help="print cells and exit")
     # RunSpec's own flags (--strategy, --seq-len, --model-path, ...) act as the
@@ -440,13 +447,42 @@ def main() -> None:
             f"spanning {needed} machines; hosts[0] must be this node"
         )
 
+    # A cell's results JSON is keyed on run_id alone, and run_id carries only
+    # strategy / placement / tokens / seq_len / tag. Vary anything else --
+    # sync_each_step, attn_impl, dataloader_num_workers -- and the new run
+    # overwrites the old one in place, with no warning and no way back:
+    # results/runs/ is gitignored. That is how 2A's ddp/zero3/fsdp-full cells
+    # at full/8192 were destroyed on 2026-08-15.
+    existing = [
+        (c, c.spec.out_dir / "runs" / f"{c.run_id}.json")
+        for c in cells
+        if (c.spec.out_dir / "runs" / f"{c.run_id}.json").exists()
+    ]
+
     print(f"matrix {args.matrix}: {len(cells)} cells, {len(skipped)} skipped")
     for reason in skipped:
         print(f"  skip  {reason}")
+    collide = {c.run_id for c, _ in existing}
     for c in cells:
-        print(f"  cell  {c.run_id}  [{c.place.links}]")
+        mark = "  <-- EXISTS, would be overwritten" if c.run_id in collide else ""
+        print(f"  cell  {c.run_id}  [{c.place.links}]{mark}")
     if args.list:
         return
+
+    if existing and not args.overwrite:
+        raise SystemExit(
+            f"\n{len(existing)} of {len(cells)} cells already have results and "
+            "would be overwritten:\n"
+            + "\n".join(f"  {p}" for _, p in existing)
+            + "\n\nresults/runs/ is gitignored, so this is not recoverable. "
+            "Pick one:\n"
+            "  --tag <name>   if this run varies something run_id does not "
+            "capture (a different\n"
+            "                 sync/attn/dataloader setting, or a replicate) -- "
+            "keeps both\n"
+            "  --overwrite    if you really do mean to replace these cells\n"
+            "  --only ...     to narrow the sweep to cells that have not run yet"
+        )
 
     if args.preflight and not args.dry_run:
         for host in args.hosts[1:needed]:

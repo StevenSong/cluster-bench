@@ -652,6 +652,157 @@ def provenance_spread(runs: list[dict[str, Any]]) -> list[str]:
     return notes
 
 
+def _agg(vals: list[float]) -> dict[str, Any]:
+    n = len(vals)
+    mean = sum(vals) / n
+    sd = (sum((v - mean) ** 2 for v in vals) / (n - 1)) ** 0.5 if n > 1 else 0.0
+    return {
+        "n": n,
+        "mean": mean,
+        "sd": sd,
+        "sem": sd / n**0.5,
+        "cv": sd / mean if mean else None,
+        "min": min(vals),
+        "max": max(vals),
+        "range_frac": (max(vals) - min(vals)) / min(vals) if min(vals) else None,
+    }
+
+
+def summary(runs: list[dict[str, Any]], baseline: str = "ddp") -> dict[str, Any]:
+    """Everything the write-ups quote, derived once and in one place.
+
+    The tables in README.md and CLAUDE.md were hand-computed for several
+    rounds, which is how ten stale figures survived into them -- numbers from
+    runs that had since been re-measured or overwritten, each individually
+    plausible. `--json-out` now carries the derived quantities themselves
+    (exposed comm, its uncertainty, the (N-1)/N-normalised form the placement
+    conclusions are read from) so prose can cite this file rather than
+    arithmetic done by hand against whichever table was on screen.
+
+    Replicates are pooled across tags, so a *condition* tag like `nosync` is
+    pooled with the plain re-runs it should be compared against rather than
+    averaged into. Every sample is listed with its tag so any pooling decision
+    can be redone downstream; nothing here can tell a replicate from a
+    condition on its own.
+    """
+    by_cell: dict[tuple, list[tuple[str, float]]] = {}
+    world: dict[tuple, int] = {}
+    for r in runs:
+        if "step_time_p50_s" not in r:
+            continue
+        cell = (
+            r["placement"]["name"],
+            r["tokens_per_gpu_step"],
+            r["spec"]["seq_len"],
+            r["strategy"]["name"],
+        )
+        by_cell.setdefault(cell, []).append(
+            (r["spec"].get("tag", "") or "-", r["step_time_p50_s"])
+        )
+        world[cell[:3]] = r["placement"]["world_size"]
+
+    replicates = {
+        cell: {
+            **_agg([v for _, v in samples]),
+            "samples": [{"tag": t, "step_time_p50_s": v} for t, v in sorted(samples)],
+        }
+        for cell, samples in by_cell.items()
+    }
+
+    derived = []
+    for group in sorted({c[:3] for c in by_cell}):
+        by_strategy = {c[3]: replicates[c] for c in by_cell if c[:3] == group}
+        base_name = next(
+            (
+                s
+                for s in [baseline] + [b for b in BASELINE_STRATEGIES if b != baseline]
+                if s in by_strategy
+            ),
+            None,
+        )
+        if base_name is None:
+            continue
+        base = by_strategy[base_name]
+        n_gpu = world[group]
+        # Per-GPU all-gather volume scales as (N-1)/N, so dividing by it is what
+        # makes a 2-, 4- and 8-GPU cell comparable -- the form 2B is read in.
+        gather_factor = (n_gpu - 1) / n_gpu if n_gpu > 1 else None
+        rows = []
+        for name, agg in sorted(by_strategy.items(), key=lambda kv: kv[1]["mean"]):
+            exposed = agg["mean"] - base["mean"]
+            unc = (agg["sem"] ** 2 + base["sem"] ** 2) ** 0.5
+            rows.append(
+                {
+                    "strategy": name,
+                    "n": agg["n"],
+                    "step_time_p50_s": agg["mean"],
+                    "exposed_comm_s": None if name == base_name else exposed,
+                    "exposed_comm_unc_s": None if name == base_name else unc,
+                    "exposed_comm_normalised": (
+                        None
+                        if name == base_name or not gather_factor
+                        else exposed / gather_factor
+                    ),
+                    "comm_overhead": agg["mean"] / base["mean"] - 1,
+                }
+            )
+        derived.append(
+            {
+                "placement": group[0],
+                "tokens_per_gpu_step": group[1],
+                "seq_len": group[2],
+                "world_size": n_gpu,
+                "baseline": {"strategy": base_name, "n": base["n"], "mean": base["mean"]},
+                "strategies": rows,
+            }
+        )
+
+    return {
+        "baseline_strategy": baseline,
+        "note": (
+            "exposed_comm_s = step_time_p50 - matched baseline p50, both "
+            "replicate means; unc is the propagated standard error. "
+            "exposed_comm_normalised divides by (N-1)/N so GPU counts compare. "
+            "Replicates pool across tags -- see samples[] to re-pool."
+        ),
+        "cells": [
+            {
+                "run_id": r["run_id"],
+                "strategy": r["strategy"]["name"],
+                "placement": r["placement"]["name"],
+                "tag": r["spec"].get("tag", ""),
+                "links": r["placement"]["links"],
+                "tokens_per_gpu_step": r["tokens_per_gpu_step"],
+                "tokens_per_gpu_step_measured": r.get("tokens_per_gpu_step_measured"),
+                "step_time_p50_s": r.get("step_time_p50_s"),
+                "step_time_p95_s": r.get("step_time_p95_s"),
+                "straggler_ratio": r.get("straggler_ratio"),
+                "tokens_per_s_per_gpu": r.get("tokens_per_s_per_gpu"),
+                "peak_mem_allocated_gb": r.get("peak_mem_allocated_gb"),
+                "comm_overhead": r.get("_comm_overhead"),
+                "baseline_strategy": r.get("_baseline_name"),
+                "exposed_comm_s": (
+                    r["step_time_p50_s"] - r["_baseline_p50"]
+                    if r.get("_baseline_p50") and "step_time_p50_s" in r
+                    else None
+                ),
+            }
+            for r in runs
+        ],
+        "replicates": [
+            {
+                "placement": c[0],
+                "tokens_per_gpu_step": c[1],
+                "seq_len": c[2],
+                "strategy": c[3],
+                **agg,
+            }
+            for c, agg in sorted(replicates.items())
+        ],
+        "derived": derived,
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--runs-dir", type=Path, default=Path("results/runs"))
@@ -700,27 +851,7 @@ def main() -> None:
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(
-            json.dumps(
-                [
-                    {
-                        "run_id": r["run_id"],
-                        "strategy": r["strategy"]["name"],
-                        "placement": r["placement"]["name"],
-                        "links": r["placement"]["links"],
-                        "tokens_per_gpu_step": r["tokens_per_gpu_step"],
-                        "tokens_per_gpu_step_measured": r.get(
-                            "tokens_per_gpu_step_measured"
-                        ),
-                        "step_time_p50_s": r.get("step_time_p50_s"),
-                        "step_time_p95_s": r.get("step_time_p95_s"),
-                        "tokens_per_s_per_gpu": r.get("tokens_per_s_per_gpu"),
-                        "peak_mem_allocated_gb": r.get("peak_mem_allocated_gb"),
-                        "comm_overhead": r.get("_comm_overhead"),
-                    }
-                    for r in runs
-                ],
-                indent=2,
-            )
+            json.dumps(summary(runs, args.baseline), indent=2) + "\n"
         )
         print(f"\nwrote {args.json_out}")
 

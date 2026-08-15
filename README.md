@@ -133,6 +133,26 @@ The narrow start — DDP ceiling plus the three hpZ variants, about 20 minutes:
 python -m cluster_bench.sweep configs/matrix/2a_sharding.yaml --only ddp zero3 zero3-hpz4 zero3-hpz2
 ```
 
+### Re-running a cell, and the overwrite guard
+
+A results JSON is keyed on `run_id` — `strategy__placement__t{tokens}__s{seq}`
+plus an optional tag, and **nothing else**. Change `sync_each_step`,
+`attn_impl`, `dataloader_num_workers` or any other spec field and the re-run
+lands on the same path and destroys the original; `results/runs/` is gitignored,
+so there is no way back. That is not hypothetical — it took out 2A's
+`ddp`/`zero3`/`fsdp-full` cells at full/8192 on 2026-08-15.
+
+So `sweep.py` refuses to start when any cell already has results, names them,
+and stops before spending GPU time:
+
+```bash
+python -m cluster_bench.sweep configs/matrix/2a_sharding.yaml --only zero3 --tag rep1
+```
+
+`--tag` keeps both and is what you want for a replicate *or* a changed
+condition. `--overwrite` replaces in place, and is almost never what you want.
+`--list` shows which cells would collide without running anything.
+
 ## Why a 4B proxy for a 31B target
 
 ZeRO-3 comm is ≈ 6P bytes/GPU/step; compute is ≈ 8·P·tokens FLOPs. **P cancels.**
@@ -391,6 +411,31 @@ default 0.02 sits just inside the noise and flags a few cells spuriously.
 Each pass ends with a line stating how many cells it actually compared. A gate
 that looks like it ran but checked nothing is the failure mode it exists to
 prevent.
+
+### Quoting numbers anywhere else
+
+Cite `--json-out`, don't recompute from a printed table. It carries the derived
+quantities, not just the rows: replicate aggregates (n, mean, sd, sem, cv,
+range, and every sample with its tag) and, per comparison group, each strategy's
+exposed comm with propagated uncertainty plus its (N−1)/N-normalised form — the
+one the placement conclusions are read in.
+
+```bash
+python -m cluster_bench.report --json-out results/summary.json
+```
+
+The tables at the top of this file and in CLAUDE.md were hand-computed for
+several rounds, and ten stale figures survived into them that way: numbers from
+runs since re-measured or overwritten, each individually plausible and none of
+them wrong-looking. Anything quoted in prose should be traceable to a field in
+that file.
+
+Two caveats it cannot handle for you. Replicates pool across tags, so a
+*condition* tag like `nosync` is pooled with the plain re-runs it should be
+compared against — every sample is listed with its tag so you can re-pool.
+And `wall_clock_breakdown`'s phase timings are printed to rank 0's stdout and
+land in **no** JSON, so those are the one class of number this file cannot
+back; tee the sweep if you need them.
 
 ## Layout
 
