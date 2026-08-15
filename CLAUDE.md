@@ -33,10 +33,12 @@ Convert overhead back to **exposed comm seconds/step** (p50 minus matched DDP
 p50); the ratio hides the finding. At full/8192: fsdp-full 0.154, zero2 0.196,
 zero1 0.198, tp2-zero2 0.367, hpz2 0.437, zero3 0.456, hpz4 0.466.
 
-1. **~2/3 of flat ZeRO-3's cost is not the fabric.** FSDP2 FULL_SHARD moves the
-   same bytes as ZeRO-3 for a third of the time, and beats ZeRO-1/ZeRO-2, which
-   communicate strictly less. The residual is DeepSpeed's stage-3 runtime.
-   Whether it amortizes at 31B (an 8× longer step) is now the central question.
+1. **50–65% of flat ZeRO-3's cost is not the fabric.** FSDP2 FULL_SHARD moves
+   the same bytes as ZeRO-3 for a half to a third of the exposed time, and
+   beats ZeRO-1/ZeRO-2, which communicate strictly less. The residual is
+   DeepSpeed's stage-3 runtime. (The range, not a point: zero3's exposed comm
+   at full/8192 measured 0.456, 0.334 and 0.462 across three sessions while
+   fsdp-full held 0.165–0.170 — see result 8.)
    Corroborating: `zero0` at 0.318 s exposed is *worse* than ZeRO-1 (0.198) and
    ZeRO-2 (0.196) — inside DeepSpeed, turning ZeRO off costs more than turning
    it on. Full ordering of exposed comm s/step at full/8192: fsdp-full 0.165 ·
@@ -52,11 +54,15 @@ zero1 0.198, tp2-zero2 0.367, hpz2 0.437, zero3 0.456, hpz4 0.466.
    past the knee, and the two backends should converge. **The backend choice is
    therefore low-stakes at the 31B operating point** — spend that budget on
    memory and on confirming the ranking, not on a bake-off.
-2. **hpZ is dead.** hpz2 is slower than flat ZeRO-3 in *every* cell of 2A, 2B
-   and 2C; hpz4 too. Not a config that failed to engage — memory is +3.2/+1.6 GB,
-   exactly the secondary-partition arithmetic. It follows from (1): hpZ
-   optimizes the param gather, and the gather is not the cost. Do not take hpZ
-   to 31B; +3.2 GB at 4B extrapolates to **+25 GB/GPU at 31B**.
+2. **hpZ is dead.** hpz2 loses to flat ZeRO-3 in 6 of the 7 cells it shares
+   with it (the exception is full/8192 against zero3's slowest sample, and it
+   loses there too against the faster one); hpz4 likewise. Several individual
+   margins are inside zero3's run-to-run spread (result 8) — the evidence is
+   the *consistency of direction* across 7 independent cells, not any single
+   margin. Not a config that failed to engage: memory is +3.2/+1.6 GB, exactly
+   the secondary-partition arithmetic. It follows from (1): hpZ optimizes the
+   param gather, and the gather is not the cost. Do not take hpZ to 31B;
+   +3.2 GB at 4B extrapolates to **+25 GB/GPU at 31B**.
 3. **Cross-pair PCIe is worse than the network** — the question driving the
    whole repo. **Read it off the `fsdp-full` rows** (revised 2026-08-15; the
    DDP rows were the earlier answer and no longer carry it — see the noise
@@ -116,19 +122,40 @@ zero1 0.198, tp2-zero2 0.367, hpz2 0.437, zero3 0.456, hpz4 0.466.
    as evidence for anything. Suggestive but unpursued: the two elevated cells
    are the two that co-locate ranks on one node.
 
-7. **The instrument, not the cluster — and this one does matter.** The profile
-   above showed DeepSpeed accounts for only 82–93% of the step, with exposed
-   comm in the untimed remainder. `sync_each_step` is justified in config.py as
-   "applied identically to every config", but identical application is not
-   equal effect: ZeRO-3 has far more async comm in flight at a step boundary
-   than DDP, so the barrier exposes more of it, and in real training some of
-   that would overlap into the next step. The bias therefore differs per
-   backend and does **not** cancel in `comm_overhead`. Untested. One 15-minute
-   run bounds it — `2a_sharding.yaml --only ddp zero3 fsdp-full
-   --no-sync-each-step` at full/8192. If ZeRO-3's exposed comm falls further
-   than FSDP2's, part of the 3× backend gap in result 1 is the harness, which
-   would be the largest available correction to this study and lands directly
-   on the 0.30 s the 31B confirm is built around.
+7. **`sync_each_step` is fair — tested and closed 2026-08-15.** The worry was
+   that the per-step barrier exposes ZeRO-3's async comm disproportionately,
+   since DeepSpeed accounts for only 82–93% of the step and has more in flight
+   at a step boundary than DDP. Measured with `--no-sync-each-step --tag
+   nosync` at full/8192: exposed comm went 0.1650 → 0.1702 for fsdp-full and
+   0.4561 → 0.4615 for zero3 — both slightly *up*, neither materially changed.
+   The barrier is not inflating either backend and is not the source of the
+   backend gap. Every number stands on this count.
+
+8. **Run-to-run variance is backend-specific, and ZeRO-3's is large.** Three
+   independent sessions at full/8192 (original, the recovery re-run, and the
+   nosync run):
+
+   | | p50 spread | exposed-comm spread |
+   |---|---|---|
+   | ddp | 1.3% | — |
+   | fsdp-full | **0.7%** | **3.2%** |
+   | zero3 | **8.6%** | **38.4%** |
+
+   zero3 measured 1.4539, 1.4538, 1.3386 — two agreeing to four decimals and
+   one 8% faster. A p50 over 80 steps should not do that, which points at an
+   initialization-time decision (NCCL channel/algorithm layout renegotiated per
+   run) rather than per-step jitter; stage 3's many small collectives would be
+   more exposed to it than FSDP2's fewer larger ones. Possibly bimodal.
+
+   **Consequences.** Result 1's magnitude is a range, 50–65%, not "~2/3".
+   Every zero3 cell in 2B and 2C is a single sample, and those rows were read
+   at 4–14% margins — inside this spread; result 3 survives only because it
+   now rests on the fsdp-full rows. And FSDP2's case gets stronger: faster,
+   lower p95/p50 (1.14–1.23 vs 1.42–1.47), and ~12× more reproducible.
+
+   **Nothing new should be concluded from a single ZeRO-3 cell until this is
+   characterised.** Next: `--only zero3 --tag rep1/rep2/rep3`, ~15 min, the
+   highest-value run outstanding.
 
 **Correction to the proxy argument.** "P cancels" holds for the bytes, but
 comm/compute = 6·A/(8·T·B) and *achieved* FLOP/s A does not cancel. The DDP
@@ -306,6 +333,16 @@ problem from a comm problem.
 - Fixed seed; measure steps/sec at fixed tokens/step (bfd packing makes step count vary)
 - Correctness gate: every config must match a reference loss curve at fixed seed —
   catches packing-mask and loss-normalization bugs that fast-but-wrong configs hide
+- **Always `--tag` a run that varies anything not in the run_id.** `run_id` is
+  `strategy__placement__t{tokens}__s{seq}[__tag]` and nothing else — so a sweep
+  that changes `sync_each_step`, `attn_impl`, `dataloader_num_workers` or any
+  other spec field writes to the *same* `results/runs/<run_id>.json` and
+  silently destroys the original. `results/runs/` is gitignored, so there is no
+  recovery. This clobbered 2A's ddp/zero3/fsdp-full cells at full/8192 on
+  2026-08-15 (re-run, and the accidental repeat became result 8).
+- **A single 8-GPU cell is not a measurement.** See result 8: fsdp-full and ddp
+  repeat to under 1.5%, zero3 to 8.6%. Repeat any DeepSpeed cell whose margin
+  matters, with `--tag rep1/rep2/...`.
 
 ## Reporting
 Headline metric: `comm_overhead = (step_time_config / step_time_ddp) - 1`.
