@@ -17,6 +17,69 @@ Tier 0 (topology validation, nccl-tests) and Tier 1 (NCCL env var sweep) are
 done. This repo is Tier 2: sharding strategy, placement, and the tokens/GPU
 crossover.
 
+## Findings — read this first
+
+**Yes, the cross-pair PCIe hop is worse than the network.** Measured through
+FSDP2 at 8192 tok/GPU/step, normalised exposed communication per GPU is 0.118
+on NVLink, 0.304 over RoCE, and **0.355 across the PCIe hop** — the full
+three-tier hierarchy, with PCIe last. The 4-GPU comparison is the clean one:
+`pair-per-node` (NVLink + RoCE, zero PCIe) costs 0.200 against `one-node`
+(NVLink + PCIe) at 0.261.
+
+### How to train on this node
+
+Default to **FSDP2 FULL_SHARD**, not DeepSpeed ZeRO-3: same bytes on the wire,
+but ~0.17 s/step of exposed communication instead of ~0.41 (17% over the
+measured DDP compute ceiling rather than 41%), plus a lower and steadier tail
+(p95/p50 1.15 vs 1.54), 4× better run-to-run reproducibility, and marginally
+lower peak memory. Skip hpZ and skip tensor parallelism — hpZ costs +3.2 GB/GPU
+for a speedup indistinguishable from zero, and TP=2 adds ~0.17 s/step of
+synchronous, unhideable all-reduce even when confined entirely to NVLink. Then
+push tokens per GPU per step as high as memory allows: communication per step is
+fixed regardless of batch size, so overhead collapses between 8192 and 16384
+tok/GPU (17% → 6% → 2%), and above ~16k tok/GPU sharding is close to free here.
+If a job doesn't need all 8 GPUs, keep it off the cross-pair PCIe hop — one
+NVLink pair for 2 GPUs, one pair per node for 4 (~6% faster than four GPUs on
+one node). At 8 GPUs you cross everything and ~17% is the floor.
+
+### The 2A table, 8 GPUs at 8192 tok/GPU/step
+
+Exposed comm is p50 minus the matched DDP p50 — the DDP cell is a *measured*
+zero-param-comm compute ceiling, not spec FLOPS.
+
+| config | p50 s | exposed comm s/step | overhead | peak GB |
+|---|---|---|---|---|
+| ddp (ceiling) | 0.9984 † | — | — | 38.6 |
+| **fsdp-full** | **1.1643** † | **0.166 ± 0.006** | **+16.6%** | **12.0** |
+| zero2 | 1.1942 | 0.196 | +19.6% | 17.7 |
+| zero1 | 1.1955 | 0.197 | +19.7% | 17.7 |
+| zero0 | 1.3163 | 0.318 | +31.8% | 75.0 |
+| tp2-zero2 | 1.3652 | 0.367 | +36.7% | 16.4 |
+| zero3 | 1.4102 † | 0.412 ± 0.020 | +41.2% | 13.2 |
+| zero3-hpz2 | 1.4350 | 0.437 | +43.7% | 16.4 |
+| zero3-hpz4 | 1.4636 | 0.465 | +46.6% | 14.8 |
+
+† mean of replicates (n=3–6). The rest are single samples, and DeepSpeed cells
+carry a ~3.4% run-to-run spread, so margins under ~10% between them are not
+resolvable — see "Reading the results".
+
+**59.7% ± 2.4% of ZeRO-3's exposed cost is not the fabric.** FSDP2 moves
+identical bytes for 40% of the time, and beats ZeRO-1/ZeRO-2, which communicate
+strictly less. It amortizes, though: `zero3 − fsdp-full` falls from ~0.30 s at
+8192 tok/GPU to 0.036 s at 32768, so at a 31B-sized step the backends should
+converge and the choice matters less than it does here.
+
+### What is not established
+
+* Everything above is a dense 4B proxy at the 31B operating point. **The 31B
+  confirmation has not been run**, and the "P cancels" argument only holds at
+  equal MFU — see the correction in CLAUDE.md.
+* The DDP denominator is bf16-in-place while every sharded cell keeps fp32
+  master weights, so no reference loss curve gates it. `zero0` was built to
+  close that and failed on both counts.
+* 2 nodes is one hop: this validates a node pair, not a fabric. No incast,
+  congestion, multi-hop or ECMP-collision signal.
+
 ## Quickstart
 
 ```bash

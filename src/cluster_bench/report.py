@@ -41,6 +41,11 @@ BASELINE_LIKE_FOR_LIKE_TOL = 0.03
 # the trainer already took a mean puts a factor of the world size between them.
 GRAD_NORM_SPREAD_TOL = 2.0
 
+# Run-to-run p50 spread above which a cell's own replicates are wider than most
+# of the margins being read off the table, so single samples of it stop
+# supporting comparisons. Reported by summarize_replicates.
+REPLICATE_SPREAD_WARN = 0.05
+
 # Backends whose optimizer keeps fp32 master weights. DeepSpeed's bf16 path
 # holds an fp32 partitioned copy of every parameter and applies the Adam update
 # in fp32; accelerate's FSDP2 path does the same. Plain DDP does not:
@@ -155,15 +160,77 @@ def annotate(
     order = [baseline] + [s for s in BASELINE_STRATEGIES if s != baseline]
     by_group = _p50_by_group(runs)
     for r in runs:
-        group = by_group.get(_group_key(r), {})
+        key = _group_key(r)
+        group = by_group.get(key, {})
         name = next((s for s in order if s in group), None)
-        r["_baseline_name"] = name
+        # A tagged group with no baseline of its own falls back to the untagged
+        # cell's. That is right for a replicate (`--tag rep1` varies nothing, so
+        # the canonical denominator applies) and would be wrong for a condition
+        # change like `--tag nosync` -- which is why the fallback only fires when
+        # the tagged group has no baseline at all. nosync ran its own ddp and
+        # never reaches this. The `*` marks the crossing so it is never silent.
+        cross = False
+        if name is None and key[3]:
+            untagged = by_group.get((*key[:3], ""), {})
+            name = next((s for s in order if s in untagged), None)
+            if name:
+                group, cross = untagged, True
+        r["_baseline_name"] = f"{name}*" if cross else name
         base = group.get(name) if name else None
         r["_baseline_p50"] = base
         r["_comm_overhead"] = (
             r["step_time_p50_s"] / base - 1 if base and "step_time_p50_s" in r else None
         )
     return runs
+
+
+def summarize_replicates(runs: list[dict[str, Any]]) -> list[str]:
+    """Run-to-run spread for every cell that was run more than once.
+
+    The only thing that says whether a margin elsewhere in the table is real.
+    Measured 2026-08-15 at full/8192: fsdp-full and ddp repeat to ~1%, zero3 to
+    ~9% -- so the noise floor is a property of the *backend*, not of the
+    cluster, and a single number carries a different weight depending on which
+    row it is in. Replicates are distinguished only by tag, so this groups
+    across tags deliberately; a condition change like nosync will show up here
+    too and should be read as a comparison rather than as noise.
+    """
+    by_cell: dict[tuple, list[tuple[str, float]]] = {}
+    for r in runs:
+        if "step_time_p50_s" not in r:
+            continue
+        key = (
+            r["placement"]["name"],
+            r["tokens_per_gpu_step"],
+            r["spec"]["seq_len"],
+            r["strategy"]["name"],
+        )
+        by_cell.setdefault(key, []).append(
+            (r["spec"].get("tag", "") or "-", r["step_time_p50_s"])
+        )
+
+    notes = []
+    for (place, tokens, _seq, strategy), samples in sorted(by_cell.items()):
+        if len(samples) < 2:
+            continue
+        vals = [v for _, v in samples]
+        n = len(vals)
+        mean = sum(vals) / n
+        sd = (sum((v - mean) ** 2 for v in vals) / (n - 1)) ** 0.5
+        rng = (max(vals) - min(vals)) / min(vals)
+        line = (
+            f"{strategy} @ {place}/t{tokens}: n={n} mean {mean:.4f} sd {sd:.4f} "
+            f"cv {sd / mean:.1%} range {rng:.1%} "
+            f"[{', '.join(f'{t}:{v:.4f}' for t, v in sorted(samples))}]"
+        )
+        if rng > REPLICATE_SPREAD_WARN:
+            line += (
+                f" -- above the {REPLICATE_SPREAD_WARN:.0%} line: margins "
+                "smaller than this involving this cell are not resolvable "
+                "from single samples"
+            )
+        notes.append(line)
+    return notes
 
 
 def check_baseline_candidates(runs: list[dict[str, Any]]) -> list[str]:
@@ -613,6 +680,7 @@ def main() -> None:
     for label, notes in (
         ("provenance", provenance_spread(runs)),
         ("token control", check_token_control(runs)),
+        ("replicates", summarize_replicates(runs)),
         ("baseline", check_baseline_candidates(runs)),
         ("plausibility", check_hpz_plausibility(runs)),
         ("optimizer precision", check_precision_class_evidence(runs)),

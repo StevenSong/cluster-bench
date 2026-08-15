@@ -33,12 +33,12 @@ Convert overhead back to **exposed comm seconds/step** (p50 minus matched DDP
 p50); the ratio hides the finding. At full/8192: fsdp-full 0.154, zero2 0.196,
 zero1 0.198, tp2-zero2 0.367, hpz2 0.437, zero3 0.456, hpz4 0.466.
 
-1. **50–65% of flat ZeRO-3's cost is not the fabric.** FSDP2 FULL_SHARD moves
-   the same bytes as ZeRO-3 for a half to a third of the exposed time, and
-   beats ZeRO-1/ZeRO-2, which communicate strictly less. The residual is
-   DeepSpeed's stage-3 runtime. (The range, not a point: zero3's exposed comm
-   at full/8192 measured 0.456, 0.334 and 0.462 across three sessions while
-   fsdp-full held 0.165–0.170 — see result 8.)
+1. **60% of flat ZeRO-3's cost is not the fabric** — 59.7% ± 2.4%, from n=6
+   replicates each at full/8192 (result 8). Exposed comm: fsdp-full
+   **0.1659 ± 0.0056** s/step, zero3 **0.4118 ± 0.0201**, ratio **2.48 ± 0.15**.
+   FSDP2 FULL_SHARD moves the same bytes as ZeRO-3 for 40% of the exposed time,
+   and beats ZeRO-1/ZeRO-2, which communicate strictly less. The residual is
+   DeepSpeed's stage-3 runtime.
    Corroborating: `zero0` at 0.318 s exposed is *worse* than ZeRO-1 (0.198) and
    ZeRO-2 (0.196) — inside DeepSpeed, turning ZeRO off costs more than turning
    it on. Full ordering of exposed comm s/step at full/8192: fsdp-full 0.165 ·
@@ -54,15 +54,17 @@ zero1 0.198, tp2-zero2 0.367, hpz2 0.437, zero3 0.456, hpz4 0.466.
    past the knee, and the two backends should converge. **The backend choice is
    therefore low-stakes at the 31B operating point** — spend that budget on
    memory and on confirming the ranking, not on a bake-off.
-2. **hpZ is dead.** hpz2 loses to flat ZeRO-3 in 6 of the 7 cells it shares
-   with it (the exception is full/8192 against zero3's slowest sample, and it
-   loses there too against the faster one); hpz4 likewise. Several individual
-   margins are inside zero3's run-to-run spread (result 8) — the evidence is
-   the *consistency of direction* across 7 independent cells, not any single
-   margin. Not a config that failed to engage: memory is +3.2/+1.6 GB, exactly
-   the secondary-partition arithmetic. It follows from (1): hpZ optimizes the
-   param gather, and the gather is not the cost. Do not take hpZ to 31B;
-   +3.2 GB at 4B extrapolates to **+25 GB/GPU at 31B**.
+2. **hpZ is dead, and the argument is memory, not speed.** hpz2 costs
+   **+3.2 GB** and hpz4 **+1.6 GB** over flat ZeRO-3 — exactly the
+   secondary-partition arithmetic, so the feature is live and correctly sized,
+   and memory has no run-to-run variance to argue about. What it buys is at
+   best nothing: hpz2 is slower than flat ZeRO-3 in 7 of 7 shared cells, though
+   several of those margins sit inside zero3's own spread (result 8), so the
+   evidence is the consistency of direction, not any single cell. A hard,
+   exactly-measured memory cost for a speed difference indistinguishable from
+   zero. It follows from (1): hpZ optimizes the param gather, and the gather is
+   not the cost. Do not take hpZ to 31B — +3.2 GB at 4B extrapolates to
+   **+25 GB/GPU at 31B**.
 3. **Cross-pair PCIe is worse than the network** — the question driving the
    whole repo. **Read it off the `fsdp-full` rows** (revised 2026-08-15; the
    DDP rows were the earlier answer and no longer carry it — see the noise
@@ -131,31 +133,33 @@ zero1 0.198, tp2-zero2 0.367, hpz2 0.437, zero3 0.456, hpz4 0.466.
    The barrier is not inflating either backend and is not the source of the
    backend gap. Every number stands on this count.
 
-8. **Run-to-run variance is backend-specific, and ZeRO-3's is large.** Three
-   independent sessions at full/8192 (original, the recovery re-run, and the
-   nosync run):
+8. **Run-to-run variance is backend-specific; ZeRO-3's is ~4× FSDP2's.**
+   Replicated at full/8192, n=6 each (`report.summarize_replicates` prints this
+   on every report):
 
-   | | p50 spread | exposed-comm spread |
-   |---|---|---|
-   | ddp | 1.3% | — |
-   | fsdp-full | **0.7%** | **3.2%** |
-   | zero3 | **8.6%** | **38.4%** |
+   | | n | mean | sd | cv | range |
+   |---|---|---|---|---|---|
+   | ddp | 3 | 0.9984 | 0.0064 | 0.64% | 1.3% |
+   | fsdp-full | 6 | 1.1643 | 0.0101 | **0.87%** | 2.3% |
+   | zero3 | 6 | 1.4102 | 0.0485 | **3.44%** | 8.6% |
 
-   zero3 measured 1.4539, 1.4538, 1.3386 — two agreeing to four decimals and
-   one 8% faster. A p50 over 80 steps should not do that, which points at an
-   initialization-time decision (NCCL channel/algorithm layout renegotiated per
-   run) rather than per-step jitter; stage 3's many small collectives would be
-   more exposed to it than FSDP2's fewer larger ones. Possibly bimodal.
+   Unimodal, broad — no bimodality (sorted: 1.3386 · 1.3689 · 1.4031 · 1.4429 ·
+   1.4538 · 1.4539; the two matching to four decimals are coincidence).
+   Tails differ the same way: p95/p50 is 1.42–1.78 for zero3 against 1.09–1.23
+   for fsdp-full, so FSDP2's tail is both lower and steadier.
 
-   **Consequences.** Result 1's magnitude is a range, 50–65%, not "~2/3".
-   Every zero3 cell in 2B and 2C is a single sample, and those rows were read
-   at 4–14% margins — inside this spread; result 3 survives only because it
-   now rests on the fsdp-full rows. And FSDP2's case gets stronger: faster,
-   lower p95/p50 (1.14–1.23 vs 1.42–1.47), and ~12× more reproducible.
+   **What it costs.** A single zero3 sample carries ±0.049 s (1σ), so any
+   margin under ~10% involving one is unresolved. That kills 2B's zero3 rows
+   (within-pair/across-pairs/one-node/pair-per-node span 4.3%, all noise —
+   which is why result 3 rests on fsdp-full) and 2A's middle cluster (zero3,
+   tp2-zero2, hpz2, hpz4 are within ~1σ of each other). It does **not** touch
+   2B through fsdp-full (separations are 0.05–0.20 s against ~0.010 s
+   uncertainty), 2C (the knee is a 2–5× change), or the clean 2A separations
+   fsdp-full < zero1/zero2 < zero0 < that cluster.
 
-   **Nothing new should be concluded from a single ZeRO-3 cell until this is
-   characterised.** Next: `--only zero3 --tag rep1/rep2/rep3`, ~15 min, the
-   highest-value run outstanding.
+   **No further replicates needed.** The one cell that needed characterising
+   has been, and every conclusion that depended on an unreplicated ZeRO-3
+   margin has been moved onto fsdp-full or onto memory.
 
 **Correction to the proxy argument.** "P cancels" holds for the bytes, but
 comm/compute = 6·A/(8·T·B) and *achieved* FLOP/s A does not cancel. The DDP
