@@ -98,10 +98,10 @@ log; treat them accordingly.
    | tok/GPU | zero3 | fsdp-full | ratio |
    |---|---|---|---|
    | 2048 | 0.444 | 0.124 | 3.6× |
-   | 4096 | 0.410 | 0.113 | 3.6× |
+   | 4096 | 0.411 | 0.113 | 3.6× |
    | 8192 | 0.403 | 0.166 | 2.4× |
    | 16384 | 0.195 | 0.101 | 1.9× |
-   | 32768 | 0.094 | 0.058 | 1.6× |
+   | 32768 | 0.094 | 0.059 | 1.6× |
 
    Both backends knee in the same place. So the durable claim is *the knee sits
    between 8192 and 16384 tok/GPU/step on this cluster* — the **magnitude** is
