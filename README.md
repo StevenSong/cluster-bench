@@ -58,10 +58,10 @@ zero-param-comm compute ceiling, not spec FLOPS.
 | zero2 | 1.1942 | 0.195 | +19.6% | 17.7 |
 | zero1 | 1.1955 | 0.197 | +19.7% | 17.7 |
 | zero0 | 1.3163 | 0.318 | +31.8% | 75.0 |
-| tp2-zero2 | 1.3652 | 0.366 | +36.7% | 16.4 |
+| tp2-zero2 | 1.3652 | 0.367 | +36.7% | 16.4 |
 | zero3 | 1.4015 † | 0.403 ± 0.023 | +40.3% | 13.2 |
 | zero3-hpz2 | 1.4350 | 0.436 | +43.7% | 16.4 |
-| zero3-hpz4 | 1.4636 | 0.465 | +46.6% | 14.8 |
+| zero3-hpz4 | 1.4636 | 0.465 | +46.5% | 14.8 |
 
 † mean of replicates (n=2–5), as printed by `report.py`'s `replicates` section.
 The rest are single samples, and DeepSpeed cells carry a ~3.5% run-to-run
@@ -430,12 +430,22 @@ runs since re-measured or overwritten, each individually plausible and none of
 them wrong-looking. Anything quoted in prose should be traceable to a field in
 that file.
 
-Two caveats it cannot handle for you. Replicates pool across tags, so a
-*condition* tag like `nosync` is pooled with the plain re-runs it should be
-compared against — every sample is listed with its tag so you can re-pool.
-And `wall_clock_breakdown`'s phase timings are printed to rank 0's stdout and
-land in **no** JSON, so those are the one class of number this file cannot
-back; tee the sweep if you need them.
+Three things to know when reading it:
+
+* **Spread is `null` for an n=1 cell, not zero.** A lone measurement has an
+  unknown spread, and zero is the one answer certainly wrong — reported as
+  ±0.0000 it would claim four-decimal accuracy for a number whose own backend
+  varies 3.5% run to run. `exposed_comm_unc_s` is likewise null unless *both*
+  sides were replicated. For a single-sample cell, use the cv of that strategy
+  from a replicated cell as the proxy: `fsdp-full` ~1%, `ddp` ~1%, DeepSpeed
+  stage 3 ~3.5%.
+* **Replicates pool across tags**, so a *condition* tag like `nosync` gets
+  pooled with the plain re-runs it should be compared against. Every sample is
+  listed with its tag so you can re-pool; nothing in the data distinguishes a
+  replicate from a condition change.
+* **`wall_clock_breakdown` phase timings are not in it.** DeepSpeed prints them
+  to rank 0's stdout and no results JSON captures them, so they are the one
+  class of number this file cannot back. Tee the sweep if you need them.
 
 ## Layout
 

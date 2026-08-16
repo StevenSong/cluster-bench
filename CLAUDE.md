@@ -31,7 +31,7 @@ README.md carries the full operating manual. This file is the standing plan.
 ## Results of the first pass (2026-08-15) — read this before planning runs
 Convert overhead back to **exposed comm seconds/step** (p50 minus matched DDP
 p50); the ratio hides the finding. At full/8192: fsdp-full 0.166, zero2 0.195,
-zero1 0.197, zero0 0.318, tp2-zero2 0.366, zero3 0.403, hpz2 0.436, hpz4 0.465.
+zero1 0.197, zero0 0.318, tp2-zero2 0.367, zero3 0.403, hpz2 0.436, hpz4 0.465.
 All figures below are recomputed from the JSONs currently in `results/runs/`,
 against the ddp replicate mean of 0.9987 — *except* the DeepSpeed phase
 breakdown in result 6, which `wall_clock_breakdown` prints to rank 0's stdout
@@ -47,7 +47,7 @@ log; treat them accordingly.
    Corroborating: `zero0` at 0.318 s exposed is *worse* than ZeRO-1 (0.197) and
    ZeRO-2 (0.195) — inside DeepSpeed, turning ZeRO off costs more than turning
    it on. Full ordering of exposed comm s/step at full/8192: fsdp-full 0.166 ·
-   zero2 0.195 · zero1 0.197 · **zero0 0.318** · tp2-zero2 0.366 · zero3 0.403 ·
+   zero2 0.195 · zero1 0.197 · **zero0 0.318** · tp2-zero2 0.367 · zero3 0.403 ·
    hpz2 0.436 · hpz4 0.465.
 
    **But the gap is not a fixed cost, and it amortizes** (2C, 2026-08-15).
@@ -109,11 +109,11 @@ log; treat them accordingly.
    and does not transfer. Trust 8192 and up — DDP goes 0.7236 → 0.7690 s for 2×
    the tokens at the bottom of the range, so those points measure fixed cost
    against fixed cost.
-5. **TP=2 costs ~0.17 s/step** even entirely on NVLink (0.366 against zero2's
+5. **TP=2 costs ~0.17 s/step** even entirely on NVLink (0.367 against zero2's
    0.195), as predicted: TP all-reduces are synchronous and unhideable.
 6. **The 2-GPU same-node ZeRO-3 cells are not a fabric effect.** Exposed comm
    normalised by the (N−1)/N gather factor is 0.46–0.49 everywhere except
-   across-pairs (0.680) and within-pair (0.790) — the fastest link, worst per
+   across-pairs (0.679) and within-pair (0.790) — the fastest link, worst per
    byte. Profiled 2026-08-15 (`2b_anomaly_profile.yaml`): **every DeepSpeed
    timer is placement-flat within 2.7%, and within-pair is fastest in all of
    them.** `bwd_allreduce` is 5–16 ms, ~1% of the step. The entire difference

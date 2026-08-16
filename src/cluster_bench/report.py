@@ -653,9 +653,28 @@ def provenance_spread(runs: list[dict[str, Any]]) -> list[str]:
 
 
 def _agg(vals: list[float]) -> dict[str, Any]:
+    """Aggregate replicates. Spread is **null** for a single sample, not zero.
+
+    A lone measurement has an unknown spread, and zero is the one answer that
+    is certainly wrong -- reported as ±0.0000 it claims four-decimal accuracy
+    for a number whose own backend varies by 3.5% run to run. Null forces the
+    reader to go find the cv from a replicated cell of the same strategy, which
+    is the honest proxy.
+    """
     n = len(vals)
     mean = sum(vals) / n
-    sd = (sum((v - mean) ** 2 for v in vals) / (n - 1)) ** 0.5 if n > 1 else 0.0
+    if n < 2:
+        return {
+            "n": n,
+            "mean": mean,
+            "sd": None,
+            "sem": None,
+            "cv": None,
+            "min": mean,
+            "max": mean,
+            "range_frac": None,
+        }
+    sd = (sum((v - mean) ** 2 for v in vals) / (n - 1)) ** 0.5
     return {
         "n": n,
         "mean": mean,
@@ -730,7 +749,13 @@ def summary(runs: list[dict[str, Any]], baseline: str = "ddp") -> dict[str, Any]
         rows = []
         for name, agg in sorted(by_strategy.items(), key=lambda kv: kv[1]["mean"]):
             exposed = agg["mean"] - base["mean"]
-            unc = (agg["sem"] ** 2 + base["sem"] ** 2) ** 0.5
+            # Null unless *both* sides were replicated -- a difference is no
+            # better determined than its worse-determined term.
+            unc = (
+                (agg["sem"] ** 2 + base["sem"] ** 2) ** 0.5
+                if agg["sem"] is not None and base["sem"] is not None
+                else None
+            )
             rows.append(
                 {
                     "strategy": name,
@@ -761,9 +786,15 @@ def summary(runs: list[dict[str, Any]], baseline: str = "ddp") -> dict[str, Any]
         "baseline_strategy": baseline,
         "note": (
             "exposed_comm_s = step_time_p50 - matched baseline p50, both "
-            "replicate means; unc is the propagated standard error. "
+            "replicate means; exposed_comm_unc_s is the propagated standard "
+            "error, and is null unless both sides were replicated -- a single "
+            "sample has unknown spread, not zero spread. For an n=1 cell, take "
+            "the cv of the same strategy from a replicated cell as the proxy "
+            "(fsdp-full ~1%, ddp ~1%, DeepSpeed stage 3 ~3.5%). "
             "exposed_comm_normalised divides by (N-1)/N so GPU counts compare. "
-            "Replicates pool across tags -- see samples[] to re-pool."
+            "Replicates pool across tags -- see samples[] to re-pool. "
+            "wall_clock_breakdown phase timings are not here: DeepSpeed prints "
+            "them to rank 0 stdout and no results JSON captures them."
         ),
         "cells": [
             {
